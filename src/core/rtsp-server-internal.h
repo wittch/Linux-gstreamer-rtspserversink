@@ -14,6 +14,7 @@ GST_DEBUG_CATEGORY_EXTERN (gst_rtsp_sink_debug);
 #define RTP_CLOCK_RATE 90000
 #define RTP_PAYLOAD_TYPE 96
 #define RTP_MAX_PAYLOAD 1400
+#define RTP_QUEUE_MAX_PACKETS 128
 
 typedef enum
 {
@@ -89,8 +90,6 @@ typedef struct _GstRTSPSinkClient
   gint64 last_rtcp_monotonic_us;
   gchar *rtcp_cname;
   gboolean rtcp_bye_sent;
-  gboolean wait_for_live_idr;
-  GPtrArray *pending_play_au;
 } GstRTSPSinkClient;
 
 struct _GstRTSPSinkServer
@@ -129,11 +128,10 @@ struct _GstRTSPSinkServer
   gboolean have_latest_rtp;
   guint16 latest_seqnum;
   guint32 latest_rtptime;
-  GPtrArray *current_au_packets;
-  GPtrArray *cached_idr_au_packets;
-  gboolean current_au_has_idr;
   GAsyncQueue *rtp_queue;
   GThread *rtp_thread;
+  guint rtp_queue_max_packets;
+  guint64 rtp_packets_dropped;
 
   gchar *sdp;
 };
@@ -181,17 +179,11 @@ void gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server);
 gboolean gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
     GstCaps *caps, GError **error);
 void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server);
-void gst_rtsp_sink_server_clear_rtp_au_cache_unlocked (GstRTSPSinkServer *server);
-GPtrArray * gst_rtsp_sink_server_copy_cached_idr_au_unlocked
-    (GstRTSPSinkServer *server);
-gboolean gst_rtsp_sink_server_get_rtp_au_start_info (GPtrArray *au_packets,
-    guint16 *seqnum, guint32 *rtptime);
-gboolean gst_rtsp_sink_server_send_rtp_au_to_client (GstRTSPSinkServer *server,
-    GstRTSPSinkClient *client, GPtrArray *au_packets);
 void gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
     const guint8 *data, gsize size);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     GstBuffer *buffer);
+void gst_rtsp_sink_server_flush_pending_rtp_unlocked (GstRTSPSinkServer *server);
 void gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
     gboolean force_sender_report, gboolean send_bye);
 

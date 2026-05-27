@@ -44,7 +44,6 @@ gst_rtsp_sink_client_free (GstRTSPSinkClient *client)
   g_clear_object (&client->client_rtcp_addr);
   g_clear_pointer (&client->rtcp_cname, g_free);
   client->rtcp_bye_sent = FALSE;
-  g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
   g_clear_object (&client->input);
   g_clear_object (&client->connection);
   g_mutex_clear (&client->write_lock);
@@ -106,8 +105,6 @@ gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client)
   client->octet_count = 0;
   client->last_rtcp_monotonic_us = 0;
   client->rtcp_bye_sent = FALSE;
-  client->wait_for_live_idr = FALSE;
-  g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
   g_clear_object (&client->server_rtp_socket);
   g_clear_object (&client->server_rtcp_socket);
   g_clear_object (&client->client_rtp_addr);

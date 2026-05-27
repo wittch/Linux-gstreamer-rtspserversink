@@ -68,6 +68,24 @@ require_session (GstRTSPSinkClient *client, const GstRTSPSinkRequest *request)
   return g_strcmp0 (session_id, client->session_id) == 0;
 }
 
+static gboolean
+server_has_other_playing_clients_unlocked (GstRTSPSinkServer *server,
+    GstRTSPSinkClient *self)
+{
+  GList *iter;
+
+  for (iter = server->clients; iter != NULL; iter = iter->next) {
+    GstRTSPSinkClient *client = iter->data;
+
+    if (client == self)
+      continue;
+    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
 static gchar *
 build_response_base_url (GstRTSPSinkServer *server,
     const GstRTSPSinkRequest *request)
@@ -193,11 +211,18 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
       client->state = GST_RTSP_SINK_STATE_READY;
       client->rtp_channel = setup.rtp_channel;
       client->rtcp_channel = setup.rtcp_channel;
-      extra_headers = g_strdup_printf (
-          "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;ssrc=%08X;mode=play\r\n"
-          "Session: %s\r\n",
-          client->rtp_channel, client->rtcp_channel, client->ssrc,
-          client->session_id);
+      if (server->have_rtp_ssrc) {
+        extra_headers = g_strdup_printf (
+            "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;ssrc=%08X;mode=play\r\n"
+            "Session: %s\r\n",
+            client->rtp_channel, client->rtcp_channel, client->ssrc,
+            client->session_id);
+      } else {
+        extra_headers = g_strdup_printf (
+            "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;mode=play\r\n"
+            "Session: %s\r\n",
+            client->rtp_channel, client->rtcp_channel, client->session_id);
+      }
       response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
       g_free (extra_headers);
     } else {
@@ -222,20 +247,27 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
       }
 
       client->state = GST_RTSP_SINK_STATE_READY;
-      extra_headers = g_strdup_printf (
-          "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u;ssrc=%08X;mode=play\r\n"
-          "Session: %s\r\n",
-          client->client_rtp_port, client->client_rtcp_port,
-          setup.client_rtp_port, setup.client_rtcp_port, client->ssrc,
-          client->session_id);
+      if (server->have_rtp_ssrc) {
+        extra_headers = g_strdup_printf (
+            "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u;ssrc=%08X;mode=play\r\n"
+            "Session: %s\r\n",
+            client->client_rtp_port, client->client_rtcp_port,
+            setup.client_rtp_port, setup.client_rtcp_port, client->ssrc,
+            client->session_id);
+      } else {
+        extra_headers = g_strdup_printf (
+            "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u;mode=play\r\n"
+            "Session: %s\r\n",
+            client->client_rtp_port, client->client_rtcp_port,
+            setup.client_rtp_port, setup.client_rtcp_port, client->session_id);
+      }
       response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
       g_free (extra_headers);
     }
-    } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
+  } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
     gchar *extra_headers;
     guint32 rtptime = 0;
     guint16 seqnum = 0;
-    GPtrArray *cached_au = NULL;
 
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
@@ -252,29 +284,20 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     }
 
     client->state = GST_RTSP_SINK_STATE_PLAYING;
-    g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
-    if (client->ssrc != server->rtp_ssrc) {
+    if (server->have_rtp_ssrc && client->ssrc != server->rtp_ssrc) {
       g_clear_pointer (&client->rtcp_cname, g_free);
       client->ssrc = server->rtp_ssrc;
       client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
           server->address != NULL ? server->address : "localhost");
     }
-    cached_au = gst_rtsp_sink_server_copy_cached_idr_au_unlocked (server);
-    if (cached_au != NULL &&
-        gst_rtsp_sink_server_get_rtp_au_start_info (cached_au, &seqnum,
-            &rtptime)) {
-      client->pending_play_au = cached_au;
-      cached_au = NULL;
-      client->wait_for_live_idr = TRUE;
-    } else {
-      client->wait_for_live_idr = TRUE;
-      if (server->have_latest_rtp) {
-        rtptime = server->latest_rtptime;
-        seqnum = server->latest_seqnum;
-      }
+
+    if (!server_has_other_playing_clients_unlocked (server, client))
+      gst_rtsp_sink_server_flush_pending_rtp_unlocked (server);
+
+    if (server->have_latest_rtp) {
+      rtptime = server->latest_rtptime;
+      seqnum = server->latest_seqnum;
     }
-    if (cached_au != NULL)
-      g_ptr_array_unref (cached_au);
     extra_headers = g_strdup_printf (
         "Session: %s\r\n"
         "Range: npt=0.000-\r\n"
@@ -303,8 +326,8 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
     response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
     g_free (extra_headers);
-    } else if (g_ascii_strcasecmp (request->method, "TEARDOWN") == 0) {
-      gchar *extra_headers = NULL;
+  } else if (g_ascii_strcasecmp (request->method, "TEARDOWN") == 0) {
+    gchar *extra_headers = NULL;
 
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
