@@ -51,7 +51,8 @@ typedef struct _BroadcastNalData
   const guint8 *nal;
   gsize nal_size;
   gboolean marker;
-  gboolean prepend_stap;
+  gboolean au_has_idr;
+  gboolean first_in_au;
   guint32 rtptime;
 } BroadcastNalData;
 

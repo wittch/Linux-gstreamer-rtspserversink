@@ -256,14 +256,11 @@ send_h264_nal (GstRTSPSinkClient *client, const guint8 *nal, gsize nal_size,
 }
 
 static gboolean
-send_stap_a (GstRTSPSinkClient *client, guint32 rtptime)
+send_parameter_sets (GstRTSPSinkClient *client, guint32 rtptime)
 {
   GstRTSPSinkServer *server = client->server;
-  GByteArray *payload;
   GByteArray *sps = NULL;
   GByteArray *pps = NULL;
-  guint8 indicator = 24;
-  guint16 size16;
   gboolean ok;
 
   g_mutex_lock (&server->lock);
@@ -285,19 +282,9 @@ send_stap_a (GstRTSPSinkClient *client, guint32 rtptime)
     return TRUE;
   }
 
-  payload = g_byte_array_new ();
-  g_byte_array_append (payload, &indicator, 1);
-
-  size16 = g_htons ((guint16) sps->len);
-  g_byte_array_append (payload, (guint8 *) &size16, 2);
-  g_byte_array_append (payload, sps->data, sps->len);
-
-  size16 = g_htons ((guint16) pps->len);
-  g_byte_array_append (payload, (guint8 *) &size16, 2);
-  g_byte_array_append (payload, pps->data, pps->len);
-
-  ok = send_rtp_packet (client, payload->data, payload->len, FALSE, rtptime);
-  g_byte_array_unref (payload);
+  ok = send_h264_nal (client, sps->data, sps->len, FALSE, rtptime);
+  if (ok)
+    ok = send_h264_nal (client, pps->data, pps->len, FALSE, rtptime);
   g_byte_array_unref (sps);
   g_byte_array_unref (pps);
 
@@ -339,13 +326,15 @@ broadcast_nal_cb (GstRTSPSinkClient *client, gpointer user_data)
     return;
 
   if (client->wait_for_live_idr) {
-    if (!data->prepend_stap)
+    if (!data->au_has_idr)
       return;
-    client->wait_for_live_idr = FALSE;
+    if (data->first_in_au) {
+      if (!send_parameter_sets (client, data->rtptime))
+        return;
+      client->wait_for_live_idr = FALSE;
+    }
   }
 
-  if (data->prepend_stap)
-    send_stap_a (client, data->rtptime);
   send_h264_nal (client, data->nal, data->nal_size, data->marker,
       data->rtptime);
 }
@@ -358,6 +347,7 @@ broadcast_avc_au (GstRTSPSinkServer *server, const guint8 *data, gsize size,
   GPtrArray *nals = g_ptr_array_new ();
   GArray *sizes = g_array_new (FALSE, FALSE, sizeof (gsize));
   guint i;
+  gboolean au_has_idr = FALSE;
   BroadcastNalData payload;
 
   while (offset + server->nal_length_size <= size) {
@@ -383,18 +373,20 @@ broadcast_avc_au (GstRTSPSinkServer *server, const guint8 *data, gsize size,
     nal_size_value = nal_size;
     g_ptr_array_add (nals, (gpointer) nal);
     g_array_append_val (sizes, nal_size_value);
+    if ((nal[0] & 0x1f) == 5)
+      au_has_idr = TRUE;
     offset += nal_size;
   }
 
   for (i = 0; i < nals->len; i++) {
     const guint8 *nal = g_ptr_array_index (nals, i);
     gsize nal_size = g_array_index (sizes, gsize, i);
-    guint8 nal_type = nal[0] & 0x1f;
 
     payload.nal = nal;
     payload.nal_size = nal_size;
     payload.marker = (i + 1) == nals->len;
-    payload.prepend_stap = (nal_type == 5);
+    payload.au_has_idr = au_has_idr;
+    payload.first_in_au = (i == 0);
     payload.rtptime = rtptime;
     for_each_playing_client (server, broadcast_nal_cb, &payload);
   }
@@ -411,6 +403,7 @@ broadcast_bytestream_au (GstRTSPSinkServer *server, const guint8 *data,
   GPtrArray *nals = g_ptr_array_new ();
   GArray *sizes = g_array_new (FALSE, FALSE, sizeof (gsize));
   guint idx;
+  gboolean au_has_idr = FALSE;
   BroadcastNalData payload;
 
   while (i + 3 < size) {
@@ -453,6 +446,8 @@ broadcast_bytestream_au (GstRTSPSinkServer *server, const guint8 *data,
       gst_rtsp_sink_server_note_nal (server, nal, nal_size);
       g_ptr_array_add (nals, (gpointer) nal);
       g_array_append_val (sizes, nal_size);
+      if ((nal[0] & 0x1f) == 5)
+        au_has_idr = TRUE;
     }
     i = end;
   }
@@ -460,12 +455,12 @@ broadcast_bytestream_au (GstRTSPSinkServer *server, const guint8 *data,
   for (idx = 0; idx < nals->len; idx++) {
     const guint8 *nal = g_ptr_array_index (nals, idx);
     gsize nal_size = g_array_index (sizes, gsize, idx);
-    guint8 nal_type = nal[0] & 0x1f;
 
     payload.nal = nal;
     payload.nal_size = nal_size;
     payload.marker = (idx + 1) == nals->len;
-    payload.prepend_stap = (nal_type == 5);
+    payload.au_has_idr = au_has_idr;
+    payload.first_in_au = (idx == 0);
     payload.rtptime = rtptime;
     for_each_playing_client (server, broadcast_nal_cb, &payload);
   }
