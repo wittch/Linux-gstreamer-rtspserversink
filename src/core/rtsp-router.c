@@ -149,15 +149,10 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
         "Content-Type: application/sdp\r\n"
         "Content-Base: %s/\r\n",
         url);
-    GST_DEBUG ("serving DESCRIBE SDP: codec=%d h264-profile-level-id=%s "
-        "h264-sprop-parameter-sets=%s h265-sprop-vps=%s h265-sprop-sps=%s "
-        "h265-sprop-pps=%s",
-        server->codec,
-        GST_STR_NULL (server->h264_profile_level_id),
-        GST_STR_NULL (server->h264_sprop_parameter_sets),
-        GST_STR_NULL (server->h265_sprop_vps),
-        GST_STR_NULL (server->h265_sprop_sps),
-        GST_STR_NULL (server->h265_sprop_pps));
+    GST_DEBUG ("serving DESCRIBE SDP: media=%s encoding-name=%s fmtp=%s",
+        GST_STR_NULL (server->rtp_media),
+        GST_STR_NULL (server->rtp_encoding_name),
+        GST_STR_NULL (server->rtp_fmtp));
     response = build_basic_response (200, "OK", cseq, extra_headers,
         server->sdp != NULL ? server->sdp : "");
     g_free (extra_headers);
@@ -185,7 +180,12 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     gst_rtsp_sink_client_reset_transport (client);
     client->transport = setup.transport;
     client->seqnum = g_random_int_range (0, G_MAXUINT16);
-    client->ssrc = g_random_int ();
+    if (client->ssrc != server->rtp_ssrc) {
+      g_clear_pointer (&client->rtcp_cname, g_free);
+      client->ssrc = server->rtp_ssrc;
+      client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
+          server->address != NULL ? server->address : "localhost");
+    }
 
     if (setup.transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED) {
       gchar *extra_headers;
@@ -231,10 +231,11 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
       response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
       g_free (extra_headers);
     }
-  } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
+    } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
     gchar *extra_headers;
     guint32 rtptime = 0;
     guint16 seqnum = 0;
+    GPtrArray *cached_au = NULL;
 
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
@@ -251,16 +252,33 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     }
 
     client->state = GST_RTSP_SINK_STATE_PLAYING;
-    client->pending_play_start = FALSE;
-    client->wait_for_live_idr = TRUE;
-    if (server->have_latest_rtp) {
-      rtptime = server->latest_rtptime;
-      seqnum = server->latest_seqnum;
+    g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
+    if (client->ssrc != server->rtp_ssrc) {
+      g_clear_pointer (&client->rtcp_cname, g_free);
+      client->ssrc = server->rtp_ssrc;
+      client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
+          server->address != NULL ? server->address : "localhost");
     }
+    cached_au = gst_rtsp_sink_server_copy_cached_idr_au_unlocked (server);
+    if (cached_au != NULL &&
+        gst_rtsp_sink_server_get_rtp_au_start_info (cached_au, &seqnum,
+            &rtptime)) {
+      client->pending_play_au = cached_au;
+      cached_au = NULL;
+      client->wait_for_live_idr = TRUE;
+    } else {
+      client->wait_for_live_idr = TRUE;
+      if (server->have_latest_rtp) {
+        rtptime = server->latest_rtptime;
+        seqnum = server->latest_seqnum;
+      }
+    }
+    if (cached_au != NULL)
+      g_ptr_array_unref (cached_au);
     extra_headers = g_strdup_printf (
         "Session: %s\r\n"
         "Range: npt=0.000-\r\n"
-        "RTP-Info: url=%s/stream=0;seq=%u;rtptime=%u\r\n",
+        "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u\r\n",
         client->session_id, url, seqnum, rtptime);
     response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
     g_free (extra_headers);
@@ -285,8 +303,8 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
     response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
     g_free (extra_headers);
-  } else if (g_ascii_strcasecmp (request->method, "TEARDOWN") == 0) {
-    gchar *extra_headers = NULL;
+    } else if (g_ascii_strcasecmp (request->method, "TEARDOWN") == 0) {
+      gchar *extra_headers = NULL;
 
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
@@ -306,7 +324,9 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
     response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
     g_free (extra_headers);
+    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
     gst_rtsp_sink_client_reset_transport (client);
+    client->rtcp_bye_sent = TRUE;
     client->state = GST_RTSP_SINK_STATE_CLOSED;
     client->closed = TRUE;
   } else if (g_ascii_strcasecmp (request->method, "GET_PARAMETER") == 0) {

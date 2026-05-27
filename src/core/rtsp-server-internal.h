@@ -17,13 +17,6 @@ GST_DEBUG_CATEGORY_EXTERN (gst_rtsp_sink_debug);
 
 typedef enum
 {
-  GST_RTSP_SINK_CODEC_UNKNOWN,
-  GST_RTSP_SINK_CODEC_H264,
-  GST_RTSP_SINK_CODEC_H265,
-} GstRTSPSinkCodec;
-
-typedef enum
-{
   GST_RTSP_SINK_TRANSPORT_NONE,
   GST_RTSP_SINK_TRANSPORT_UDP,
   GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED,
@@ -59,15 +52,11 @@ typedef struct _TransportSetup
   guint16 client_rtcp_port;
 } TransportSetup;
 
-typedef struct _BroadcastNalData
+typedef struct _GstRTSPQueuedRtpPacket
 {
-  const guint8 *nal;
-  gsize nal_size;
-  gboolean marker;
-  gboolean au_has_idr;
-  gboolean first_in_au;
-  guint32 rtptime;
-} BroadcastNalData;
+  guint8 *data;
+  gsize size;
+} GstRTSPQueuedRtpPacket;
 
 typedef struct _GstRTSPSinkClient
 {
@@ -99,8 +88,9 @@ typedef struct _GstRTSPSinkClient
   guint64 octet_count;
   gint64 last_rtcp_monotonic_us;
   gchar *rtcp_cname;
-  gboolean pending_play_start;
+  gboolean rtcp_bye_sent;
   gboolean wait_for_live_idr;
+  GPtrArray *pending_play_au;
 } GstRTSPSinkClient;
 
 struct _GstRTSPSinkServer
@@ -133,27 +123,19 @@ struct _GstRTSPSinkServer
   gchar *rtp_encoding_name;
   guint rtp_payload_type;
   guint rtp_clock_rate;
+  guint32 rtp_ssrc;
+  gboolean have_rtp_ssrc;
   gchar *rtp_fmtp;
   gboolean have_latest_rtp;
   guint16 latest_seqnum;
   guint32 latest_rtptime;
+  GPtrArray *current_au_packets;
+  GPtrArray *cached_idr_au_packets;
+  gboolean current_au_has_idr;
+  GAsyncQueue *rtp_queue;
+  GThread *rtp_thread;
 
-  GstRTSPSinkCodec codec;
-  gboolean length_prefixed_format;
-  guint nal_length_size;
-  GByteArray *h264_sps;
-  GByteArray *h264_pps;
-  gchar *h264_profile_level_id;
-  gchar *h264_sprop_parameter_sets;
-  GByteArray *h265_vps;
-  GByteArray *h265_sps;
-  GByteArray *h265_pps;
-  gchar *h265_sprop_vps;
-  gchar *h265_sprop_sps;
-  gchar *h265_sprop_pps;
   gchar *sdp;
-  gboolean have_clock_base;
-  GstClockTime base_pts;
 };
 
 GstRTSPSinkClient * gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
@@ -167,6 +149,9 @@ void gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client);
 void gst_rtsp_sink_client_touch_keepalive (GstRTSPSinkClient *client);
 GSocketAddress * gst_rtsp_sink_client_remote_address_with_port
     (GstRTSPSinkClient *client, guint16 port);
+GstRTSPQueuedRtpPacket * gst_rtsp_sink_rtp_queue_packet_new (const guint8 *data,
+    gsize size);
+void gst_rtsp_sink_rtp_queue_packet_free (GstRTSPQueuedRtpPacket *packet);
 
 gboolean gst_rtsp_sink_parse_request (GstRTSPSinkClient *client,
     GstRTSPSinkRequest *request);
@@ -195,24 +180,14 @@ void gst_rtsp_sink_apply_config (GstRTSPSinkServer *server,
 void gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server);
 gboolean gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
     GstCaps *caps, GError **error);
-void gst_rtsp_sink_server_note_nal_unlocked (GstRTSPSinkServer *server,
-    const guint8 *nal, gsize nal_size);
-void gst_rtsp_sink_server_note_nal (GstRTSPSinkServer *server,
-    const guint8 *nal, gsize nal_size);
 void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server);
-gboolean gst_rtsp_sink_parse_avcc_codec_data (GstRTSPSinkServer *server,
-    GstBuffer *codec_data);
-gboolean gst_rtsp_sink_parse_hvcc_codec_data (GstRTSPSinkServer *server,
-    GstBuffer *codec_data);
-
-gboolean gst_rtsp_sink_server_set_h264_caps_internal (GstRTSPSinkServer *server,
-    GstCaps *caps, GError **error);
-gboolean gst_rtsp_sink_server_set_h265_caps_internal (GstRTSPSinkServer *server,
-    GstCaps *caps, GError **error);
-void gst_rtsp_sink_server_broadcast_h264 (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size, guint32 rtptime);
-void gst_rtsp_sink_server_broadcast_h265 (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size, guint32 rtptime);
+void gst_rtsp_sink_server_clear_rtp_au_cache_unlocked (GstRTSPSinkServer *server);
+GPtrArray * gst_rtsp_sink_server_copy_cached_idr_au_unlocked
+    (GstRTSPSinkServer *server);
+gboolean gst_rtsp_sink_server_get_rtp_au_start_info (GPtrArray *au_packets,
+    guint16 *seqnum, guint32 *rtptime);
+gboolean gst_rtsp_sink_server_send_rtp_au_to_client (GstRTSPSinkServer *server,
+    GstRTSPSinkClient *client, GPtrArray *au_packets);
 void gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
     const guint8 *data, gsize size);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,

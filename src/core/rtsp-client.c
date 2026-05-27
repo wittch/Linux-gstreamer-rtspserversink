@@ -1,15 +1,5 @@
 #include "rtsp-server-internal.h"
 
-static GBufferedInputStream *
-client_get_buffered_input (GstRTSPSinkClient *client)
-{
-  GInputStream *base;
-
-  base = g_filter_input_stream_get_base_stream (
-      G_FILTER_INPUT_STREAM (client->input));
-  return G_BUFFERED_INPUT_STREAM (base);
-}
-
 GstRTSPSinkClient *
 gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
     GSocketConnection *connection)
@@ -31,7 +21,7 @@ gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
 
   client->output = g_io_stream_get_output_stream (G_IO_STREAM (connection));
   client->seqnum = g_random_int_range (0, G_MAXUINT16);
-  client->ssrc = g_random_int ();
+  client->ssrc = server->rtp_ssrc;
   client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
       server->address != NULL ? server->address : "localhost");
   g_mutex_init (&client->write_lock);
@@ -53,6 +43,8 @@ gst_rtsp_sink_client_free (GstRTSPSinkClient *client)
   g_clear_object (&client->client_rtp_addr);
   g_clear_object (&client->client_rtcp_addr);
   g_clear_pointer (&client->rtcp_cname, g_free);
+  client->rtcp_bye_sent = FALSE;
+  g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
   g_clear_object (&client->input);
   g_clear_object (&client->connection);
   g_mutex_clear (&client->write_lock);
@@ -113,8 +105,9 @@ gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client)
   client->packet_count = 0;
   client->octet_count = 0;
   client->last_rtcp_monotonic_us = 0;
-  client->pending_play_start = FALSE;
+  client->rtcp_bye_sent = FALSE;
   client->wait_for_live_idr = FALSE;
+  g_clear_pointer (&client->pending_play_au, g_ptr_array_unref);
   g_clear_object (&client->server_rtp_socket);
   g_clear_object (&client->server_rtcp_socket);
   g_clear_object (&client->client_rtp_addr);
@@ -151,10 +144,4 @@ gst_rtsp_sink_client_remote_address_with_port (GstRTSPSinkClient *client,
 
   g_object_unref (remote_address);
   return result;
-}
-
-GBufferedInputStream *
-gst_rtsp_sink_client_peek_input (GstRTSPSinkClient *client)
-{
-  return client_get_buffered_input (client);
 }

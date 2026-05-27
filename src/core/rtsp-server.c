@@ -1,5 +1,60 @@
 #include "rtsp-server-internal.h"
 
+GstRTSPQueuedRtpPacket *
+gst_rtsp_sink_rtp_queue_packet_new (const guint8 *data, gsize size)
+{
+  GstRTSPQueuedRtpPacket *packet = g_new0 (GstRTSPQueuedRtpPacket, 1);
+
+  packet->data = g_memdup2 (data, size);
+  packet->size = size;
+  return packet;
+}
+
+void
+gst_rtsp_sink_rtp_queue_packet_free (GstRTSPQueuedRtpPacket *packet)
+{
+  if (packet == NULL)
+    return;
+
+  g_free (packet->data);
+  g_free (packet);
+}
+
+static gpointer
+rtp_broadcast_thread_main (gpointer data)
+{
+  GstRTSPSinkServer *server = data;
+
+  while (TRUE) {
+    GstRTSPQueuedRtpPacket *packet;
+    gboolean stopping;
+    guint active_pushers;
+
+    packet = g_async_queue_timeout_pop (server->rtp_queue,
+        100 * G_TIME_SPAN_MILLISECOND);
+    if (packet != NULL) {
+      gst_rtsp_sink_server_broadcast_rtp (server, packet->data, packet->size);
+      gst_rtsp_sink_rtp_queue_packet_free (packet);
+
+      g_mutex_lock (&server->lock);
+      server->active_pushers--;
+      if (server->stopping && server->active_pushers == 0)
+        g_cond_signal (&server->cond);
+      g_mutex_unlock (&server->lock);
+      continue;
+    }
+
+    g_mutex_lock (&server->lock);
+    stopping = server->stopping;
+    active_pushers = server->active_pushers;
+    g_mutex_unlock (&server->lock);
+    if (stopping && active_pushers == 0)
+      break;
+  }
+
+  return NULL;
+}
+
 void
 gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
 {
@@ -9,27 +64,12 @@ gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
   g_clear_pointer (&server->rtp_fmtp, g_free);
   server->rtp_payload_type = 0;
   server->rtp_clock_rate = 0;
+  server->rtp_ssrc = g_random_int ();
+  server->have_rtp_ssrc = FALSE;
   server->have_latest_rtp = FALSE;
   server->latest_seqnum = 0;
   server->latest_rtptime = 0;
-  server->codec = GST_RTSP_SINK_CODEC_UNKNOWN;
-  server->length_prefixed_format = FALSE;
-  server->nal_length_size = 4;
-  g_clear_pointer (&server->h264_profile_level_id, g_free);
-  g_clear_pointer (&server->h264_sprop_parameter_sets, g_free);
-  g_clear_pointer (&server->h265_sprop_vps, g_free);
-  g_clear_pointer (&server->h265_sprop_sps, g_free);
-  g_clear_pointer (&server->h265_sprop_pps, g_free);
-  if (server->h264_sps != NULL)
-    g_byte_array_set_size (server->h264_sps, 0);
-  if (server->h264_pps != NULL)
-    g_byte_array_set_size (server->h264_pps, 0);
-  if (server->h265_vps != NULL)
-    g_byte_array_set_size (server->h265_vps, 0);
-  if (server->h265_sps != NULL)
-    g_byte_array_set_size (server->h265_sps, 0);
-  if (server->h265_pps != NULL)
-    g_byte_array_set_size (server->h265_pps, 0);
+  gst_rtsp_sink_server_clear_rtp_au_cache_unlocked (server);
 }
 
 static guint
@@ -77,8 +117,28 @@ client_thread_main (gpointer data)
     if (response != NULL)
       gst_rtsp_sink_client_write_text (client, response);
 
+    if (!client->closed && client->pending_play_au != NULL) {
+      GPtrArray *pending_au = g_steal_pointer (&client->pending_play_au);
+
+      if (!gst_rtsp_sink_server_send_rtp_au_to_client (client->server, client,
+              pending_au)) {
+        g_ptr_array_unref (pending_au);
+        g_free (response);
+        gst_rtsp_sink_request_clear (&request);
+        break;
+      }
+      client->wait_for_live_idr = FALSE;
+      g_ptr_array_unref (pending_au);
+    }
+
     g_free (response);
     gst_rtsp_sink_request_clear (&request);
+  }
+
+  if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
+      !client->rtcp_bye_sent) {
+    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
+    client->rtcp_bye_sent = TRUE;
   }
 
   client->closed = TRUE;
@@ -138,6 +198,7 @@ gst_rtsp_sink_server_new (void)
   g_mutex_init (&server->lock);
   g_cond_init (&server->cond);
   gst_rtsp_sink_server_reset_codec_state_unlocked (server);
+  server->rtp_ssrc = g_random_int ();
   server->next_session_id = 1000;
   server->max_clients = 16;
   server->latency_ms = 200;
@@ -164,6 +225,10 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   g_clear_pointer (&server->rtp_media, g_free);
   g_clear_pointer (&server->rtp_encoding_name, g_free);
   g_clear_pointer (&server->rtp_fmtp, g_free);
+  g_clear_pointer (&server->current_au_packets, g_ptr_array_unref);
+  g_clear_pointer (&server->cached_idr_au_packets, g_ptr_array_unref);
+  g_clear_pointer (&server->rtp_queue, g_async_queue_unref);
+  g_clear_pointer (&server->rtp_thread, g_thread_unref);
   g_clear_pointer (&server->address, g_free);
   g_clear_pointer (&server->path, g_free);
   g_clear_pointer (&server->auth_mode, g_free);
@@ -171,21 +236,6 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   g_clear_pointer (&server->password, g_free);
   g_clear_pointer (&server->realm, g_free);
   g_clear_pointer (&server->sdp, g_free);
-  g_clear_pointer (&server->h264_profile_level_id, g_free);
-  g_clear_pointer (&server->h264_sprop_parameter_sets, g_free);
-  g_clear_pointer (&server->h265_sprop_vps, g_free);
-  g_clear_pointer (&server->h265_sprop_sps, g_free);
-  g_clear_pointer (&server->h265_sprop_pps, g_free);
-  if (server->h264_sps != NULL)
-    g_byte_array_unref (server->h264_sps);
-  if (server->h264_pps != NULL)
-    g_byte_array_unref (server->h264_pps);
-  if (server->h265_vps != NULL)
-    g_byte_array_unref (server->h265_vps);
-  if (server->h265_sps != NULL)
-    g_byte_array_unref (server->h265_sps);
-  if (server->h265_pps != NULL)
-    g_byte_array_unref (server->h265_pps);
   g_free (server);
 }
 
@@ -237,12 +287,14 @@ gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
     goto fail;
   }
   server->stopping = FALSE;
-  server->have_clock_base = FALSE;
   server->have_latest_rtp = FALSE;
   server->latest_seqnum = 0;
   server->latest_rtptime = 0;
+  server->rtp_queue = g_async_queue_new ();
   gst_rtsp_sink_apply_config (server, config);
   gst_rtsp_sink_sdp_update_unlocked (server);
+  server->rtp_thread = g_thread_new ("rtspsink-rtp",
+      rtp_broadcast_thread_main, server);
   server->accept_thread = g_thread_new ("rtspsink-accept", accept_thread_main,
       server);
   g_mutex_unlock (&server->lock);
@@ -256,6 +308,8 @@ fail:
   g_clear_object (&socket);
   g_clear_object (&socket_address);
   g_clear_object (&inet_address);
+  g_clear_pointer (&server->rtp_thread, g_thread_unref);
+  g_clear_pointer (&server->rtp_queue, g_async_queue_unref);
   g_clear_object (&server->listener);
   g_clear_object (&server->cancellable);
   return FALSE;
@@ -279,6 +333,16 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
   clients = g_list_copy (server->clients);
   g_mutex_unlock (&server->lock);
 
+  if (server->accept_thread != NULL) {
+    g_thread_join (server->accept_thread);
+    server->accept_thread = NULL;
+  }
+
+  if (server->rtp_thread != NULL) {
+    g_thread_join (server->rtp_thread);
+    server->rtp_thread = NULL;
+  }
+
   for (iter = clients; iter != NULL; iter = iter->next) {
     GstRTSPSinkClient *client = iter->data;
 
@@ -286,11 +350,6 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
     client->state = GST_RTSP_SINK_STATE_CLOSED;
     if (client->connection != NULL)
       g_io_stream_close (G_IO_STREAM (client->connection), NULL, NULL);
-  }
-
-  if (server->accept_thread != NULL) {
-    g_thread_join (server->accept_thread);
-    server->accept_thread = NULL;
   }
 
   for (iter = clients; iter != NULL; iter = iter->next) {
@@ -309,6 +368,7 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
   server->clients = NULL;
   g_clear_object (&server->listener);
   g_clear_object (&server->cancellable);
+  g_clear_pointer (&server->rtp_queue, g_async_queue_unref);
   g_mutex_unlock (&server->lock);
 }
 
