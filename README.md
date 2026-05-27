@@ -1,6 +1,6 @@
 # gst-rtsp-server-sink
 
-`rtspserversink` is a `GstBaseSink` element that publishes a single shared RTSP stream directly from a GStreamer pipeline.
+`rtspserversink` is a `GstBaseSink` element that relays `application/x-rtp` into a single shared RTSP stream directly from a GStreamer pipeline.
 
 ## Requirements
 
@@ -34,7 +34,7 @@ meson compile -C builddir
 
 ## How To Use
 
-`rtspserversink` is a sink element. Put it at the end of a normal GStreamer pipeline and feed it H.264 or H.265 elementary video.
+`rtspserversink` is a sink element. Put it at the end of a normal GStreamer pipeline and feed it RTP video from `rtph264pay` or `rtph265pay`.
 
 The common runtime pattern is:
 
@@ -54,6 +54,7 @@ gst-launch-1.0 -q \
   videotestsrc is-live=true ! \
   x264enc tune=zerolatency key-int-max=15 ! \
   h264parse ! \
+  rtph264pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
 
@@ -84,6 +85,7 @@ gst-launch-1.0 -q \
   videotestsrc is-live=true ! \
   x265enc tune=zerolatency key-int-max=15 speed-preset=ultrafast ! \
   h265parse ! \
+  rtph265pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
 
@@ -100,16 +102,10 @@ gst-launch-1.0 -v \
 
 ## Supported Sink Caps
 
-H.264:
+RTP video:
 
 ```text
-video/x-h264, stream-format={ avc, avc3, byte-stream }, alignment={ au, nal }
-```
-
-H.265:
-
-```text
-video/x-h265, stream-format={ hvc1, hev1, byte-stream }, alignment={ au, nal }
+application/x-rtp, media=video, clock-rate=90000, encoding-name={ H264, H265 }
 ```
 
 ## Hardware Encoder Examples
@@ -125,6 +121,7 @@ gst-launch-1.0 -q \
   "video/x-raw,format=NV12" ! \
   vah264enc ! \
   h264parse ! \
+  rtph264pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
 
@@ -146,6 +143,7 @@ gst-launch-1.0 -q \
   "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1" ! \
   nvcudah264enc ! \
   h264parse ! \
+  rtph264pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
 
@@ -157,55 +155,10 @@ gst-launch-1.0 -q \
   videotestsrc is-live=true ! \
   "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1" ! \
   nvcudah265enc ! \
-  rtspserversink port=9562 path=/live
-```
-
-If you need `hvc1`:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin \
-gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1" ! \
-  nvcudah265enc ! \
   h265parse ! \
-  "video/x-h265,stream-format=hvc1,alignment=au" ! \
+  rtph265pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
-
-## `nvh265enc` Compatibility Note
-
-`rtspserversink` already accepts the H.265 output shape advertised by `nvh265enc`:
-
-```text
-video/x-h265, stream-format=byte-stream, alignment=au
-```
-
-That means a sink-side HEVC transport change is not required for standard `nvh265enc` output.
-
-Known pipeline shapes:
-
-- `nvh265enc ! rtspserversink`
-- `nvh265enc ! h265parse ! video/x-h265,stream-format=byte-stream,alignment=au ! rtspserversink`
-- `nvh265enc ! h265parse ! video/x-h265,stream-format=hvc1,alignment=au ! rtspserversink`
-
-If a pipeline fails with:
-
-```text
-Could not configure supporting library
-Selected preset not supported
-```
-
-that is an encoder / driver / GPU capability issue, not a `rtspserversink` caps issue.
-
-Suggested preset fallback order:
-
-1. `preset=hp`
-2. `preset=hq`
-3. `preset=low-latency`
-4. `preset=low-latency-hp`
-
-If all of those fail, test the newer `nvcuda*` encoders on the same machine before assuming the sink is involved.
 
 ## Troubleshooting
 
@@ -246,14 +199,11 @@ If `gst-inspect-1.0 rtspserversink` fails without `GST_PLUGIN_PATH`, you are tes
 
 Validated locally on 2026-05-27:
 
-- `GST_PLUGIN_PATH=$PWD/builddir/plugin gst-inspect-1.0 rtspserversink` reports:
-  - H.264 `stream-format={ avc, avc3, byte-stream }`
-  - H.265 `stream-format={ hvc1, hev1, byte-stream }`
-  - `alignment={ au, nal }`
-- `gst-inspect-1.0 nvh265enc` reports `video/x-h265, stream-format=byte-stream, alignment=au`
-- `x265enc ! h265parse ! rtspserversink` streamed successfully
+- `GST_PLUGIN_PATH=$PWD/builddir/plugin gst-inspect-1.0 rtspserversink` reports `application/x-rtp, media=video, clock-rate=90000, encoding-name={ H264, H265 }`
+- `x264enc ! h264parse ! rtph264pay ! rtspserversink` streamed successfully
+- `x265enc ! h265parse ! rtph265pay ! rtspserversink` streamed successfully
 - `rtspsrc ! rtph265depay ! h265parse ! avdec_h265` successfully negotiated, depayloaded, parsed, and decoded the HEVC RTSP stream
-- `vah264enc ! h264parse ! rtspserversink` negotiated successfully on the local AMD VA path
+- `vah264enc ! h264parse ! rtph264pay ! rtspserversink` negotiated successfully on the local AMD VA path
 
 Additional host-specific NVIDIA notes from this machine:
 

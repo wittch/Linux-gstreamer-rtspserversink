@@ -3,6 +3,15 @@
 void
 gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
 {
+  g_clear_pointer (&server->rtp_caps, gst_caps_unref);
+  g_clear_pointer (&server->rtp_media, g_free);
+  g_clear_pointer (&server->rtp_encoding_name, g_free);
+  g_clear_pointer (&server->rtp_fmtp, g_free);
+  server->rtp_payload_type = 0;
+  server->rtp_clock_rate = 0;
+  server->have_latest_rtp = FALSE;
+  server->latest_seqnum = 0;
+  server->latest_rtptime = 0;
   server->codec = GST_RTSP_SINK_CODEC_UNKNOWN;
   server->length_prefixed_format = FALSE;
   server->nal_length_size = 4;
@@ -151,6 +160,10 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   gst_rtsp_sink_server_stop (server);
   g_cond_clear (&server->cond);
   g_mutex_clear (&server->lock);
+  g_clear_pointer (&server->rtp_caps, gst_caps_unref);
+  g_clear_pointer (&server->rtp_media, g_free);
+  g_clear_pointer (&server->rtp_encoding_name, g_free);
+  g_clear_pointer (&server->rtp_fmtp, g_free);
   g_clear_pointer (&server->address, g_free);
   g_clear_pointer (&server->path, g_free);
   g_clear_pointer (&server->auth_mode, g_free);
@@ -225,6 +238,8 @@ gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
   }
   server->stopping = FALSE;
   server->have_clock_base = FALSE;
+  server->have_latest_rtp = FALSE;
+  server->latest_seqnum = 0;
   server->latest_rtptime = 0;
   gst_rtsp_sink_apply_config (server, config);
   gst_rtsp_sink_sdp_update_unlocked (server);
@@ -309,10 +324,8 @@ gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server, GstCaps *caps,
 
   s = gst_caps_get_structure (caps, 0);
   name = gst_structure_get_name (s);
-  if (g_strcmp0 (name, "video/x-h264") == 0)
-    return gst_rtsp_sink_server_set_h264_caps_internal (server, caps, error);
-  if (g_strcmp0 (name, "video/x-h265") == 0)
-    return gst_rtsp_sink_server_set_h265_caps_internal (server, caps, error);
+  if (g_strcmp0 (name, "application/x-rtp") == 0)
+    return gst_rtsp_sink_server_set_rtp_caps_internal (server, caps, error);
 
   g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
       "unsupported caps type '%s'", GST_STR_NULL (name));

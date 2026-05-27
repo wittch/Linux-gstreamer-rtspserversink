@@ -128,6 +128,16 @@ struct _GstRTSPSinkServer
   GList *clients;
   guint next_session_id;
 
+  GstCaps *rtp_caps;
+  gchar *rtp_media;
+  gchar *rtp_encoding_name;
+  guint rtp_payload_type;
+  guint rtp_clock_rate;
+  gchar *rtp_fmtp;
+  gboolean have_latest_rtp;
+  guint16 latest_seqnum;
+  guint32 latest_rtptime;
+
   GstRTSPSinkCodec codec;
   gboolean length_prefixed_format;
   guint nal_length_size;
@@ -144,7 +154,6 @@ struct _GstRTSPSinkServer
   gchar *sdp;
   gboolean have_clock_base;
   GstClockTime base_pts;
-  guint32 latest_rtptime;
 };
 
 GstRTSPSinkClient * gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
@@ -184,6 +193,8 @@ void gst_rtsp_sink_apply_config (GstRTSPSinkServer *server,
     const GstRTSPSinkServerConfig *config);
 
 void gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server);
+gboolean gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
+    GstCaps *caps, GError **error);
 void gst_rtsp_sink_server_note_nal_unlocked (GstRTSPSinkServer *server,
     const guint8 *nal, gsize nal_size);
 void gst_rtsp_sink_server_note_nal (GstRTSPSinkServer *server,
@@ -202,6 +213,8 @@ void gst_rtsp_sink_server_broadcast_h264 (GstRTSPSinkServer *server,
     const guint8 *data, gsize size, guint32 rtptime);
 void gst_rtsp_sink_server_broadcast_h265 (GstRTSPSinkServer *server,
     const guint8 *data, gsize size, guint32 rtptime);
+void gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     GstBuffer *buffer);
 void gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,

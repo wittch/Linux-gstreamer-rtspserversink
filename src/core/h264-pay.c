@@ -1,24 +1,152 @@
 #include "rtsp-server-internal.h"
 
-static guint32
-buffer_rtptime_unlocked (GstRTSPSinkServer *server, GstClockTime pts)
+typedef struct
 {
-  guint64 scaled;
+  const guint8 *data;
+  gsize size;
+  guint8 payload_type;
+  guint32 timestamp;
+  guint16 seqnum;
+  gsize header_len;
+  gsize payload_len;
+} RtpPacketInfo;
 
-  if (!GST_CLOCK_TIME_IS_VALID (pts))
-    pts = 0;
+typedef struct
+{
+  RtpPacketInfo info;
+  gboolean has_keyframe;
+} BroadcastRtpData;
 
-  if (!server->have_clock_base) {
-    server->base_pts = pts;
-    server->have_clock_base = TRUE;
+static gboolean
+rtp_packet_info_parse (const guint8 *data, gsize size, RtpPacketInfo *info)
+{
+  guint8 csrc_count;
+  gboolean has_extension;
+  gsize header_len;
+
+  if (data == NULL || size < 12 || info == NULL)
+    return FALSE;
+
+  if (((data[0] >> 6) & 0x03) != 2)
+    return FALSE;
+
+  csrc_count = data[0] & 0x0f;
+  has_extension = (data[0] & 0x10) != 0;
+  header_len = 12 + ((gsize) csrc_count * 4);
+  if (size < header_len)
+    return FALSE;
+
+  if (has_extension) {
+    gsize extension_len;
+
+    if (size < header_len + 4)
+      return FALSE;
+    extension_len = (gsize) ((data[header_len + 2] << 8) | data[header_len + 3]);
+    header_len += 4 + (extension_len * 4);
+    if (size < header_len)
+      return FALSE;
   }
 
-  if (pts < server->base_pts)
-    pts = server->base_pts;
+  info->data = data;
+  info->size = size;
+  info->payload_type = data[1] & 0x7f;
+  info->seqnum = (guint16) ((data[2] << 8) | data[3]);
+  info->timestamp = ((guint32) data[4] << 24) | ((guint32) data[5] << 16) |
+      ((guint32) data[6] << 8) | (guint32) data[7];
+  info->header_len = header_len;
+  info->payload_len = size - header_len;
+  return TRUE;
+}
 
-  scaled = gst_util_uint64_scale (pts - server->base_pts, RTP_CLOCK_RATE,
-      GST_SECOND);
-  return (guint32) scaled;
+static gboolean
+rtp_h264_payload_is_keyframe (const guint8 *payload, gsize payload_size)
+{
+  gsize offset = 0;
+
+  if (payload == NULL || payload_size == 0)
+    return FALSE;
+
+  switch (payload[0] & 0x1f) {
+    case 5:
+      return TRUE;
+    case 24:
+      offset = 1;
+      while (offset + 2 <= payload_size) {
+        gsize nal_size = ((gsize) payload[offset] << 8) | payload[offset + 1];
+
+        offset += 2;
+        if (offset + nal_size > payload_size)
+          break;
+        if (nal_size > 0 && (payload[offset] & 0x1f) == 5)
+          return TRUE;
+        offset += nal_size;
+      }
+      return FALSE;
+    case 28:
+      if (payload_size < 2)
+        return FALSE;
+      return (payload[1] & 0x80) != 0 && (payload[1] & 0x1f) == 5;
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean
+rtp_h265_nal_is_irap (guint8 nal_type)
+{
+  return nal_type >= 16 && nal_type <= 23;
+}
+
+static gboolean
+rtp_h265_payload_is_keyframe (const guint8 *payload, gsize payload_size)
+{
+  gsize offset = 0;
+  guint8 nal_type;
+
+  if (payload == NULL || payload_size < 2)
+    return FALSE;
+
+  nal_type = (payload[0] >> 1) & 0x3f;
+  if (rtp_h265_nal_is_irap (nal_type))
+    return TRUE;
+
+  switch (nal_type) {
+    case 48:
+      offset = 2;
+      while (offset + 2 <= payload_size) {
+        gsize nal_size = ((gsize) payload[offset] << 8) | payload[offset + 1];
+
+        offset += 2;
+        if (offset + nal_size > payload_size)
+          break;
+        if (nal_size >= 2 && rtp_h265_nal_is_irap ((payload[offset] >> 1) & 0x3f))
+          return TRUE;
+        offset += nal_size;
+      }
+      return FALSE;
+    case 49:
+      if (payload_size < 3)
+        return FALSE;
+      return (payload[2] & 0x80) != 0 &&
+          rtp_h265_nal_is_irap (payload[2] & 0x3f);
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean
+rtp_packet_is_keyframe (const gchar *encoding_name, const guint8 *payload,
+    gsize payload_size)
+{
+  if (encoding_name == NULL)
+    return FALSE;
+
+  if (g_ascii_strcasecmp (encoding_name, "H264") == 0)
+    return rtp_h264_payload_is_keyframe (payload, payload_size);
+  if (g_ascii_strcasecmp (encoding_name, "H265") == 0)
+    return rtp_h265_payload_is_keyframe (payload, payload_size);
+
+  return FALSE;
 }
 
 static gboolean
@@ -48,8 +176,8 @@ send_interleaved_packet (GstRTSPSinkClient *client, guint8 channel,
 }
 
 static gboolean
-send_udp_packet (GSocket *socket, GSocketAddress *address, const guint8 *payload,
-    gsize payload_size, GstRTSPSinkClient *client)
+send_udp_packet (GSocket *socket, GSocketAddress *address,
+    const guint8 *payload, gsize payload_size, GstRTSPSinkClient *client)
 {
   GError *error = NULL;
   gssize written;
@@ -134,7 +262,8 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
       append_u32_be (packet, packet_ssrc);
       g_byte_array_append (packet, &item_type, 1);
       g_byte_array_append (packet, &cname_len, 1);
-      g_byte_array_append (packet, (const guint8 *) client->rtcp_cname, cname_len);
+      g_byte_array_append (packet, (const guint8 *) client->rtcp_cname,
+          cname_len);
       g_byte_array_append (packet, &end, 1);
 
       pad = (4 - (packet->len % 4)) % 4;
@@ -162,49 +291,43 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
 }
 
 static gboolean
-send_rtp_packet (GstRTSPSinkClient *client, const guint8 *payload,
-    gsize payload_size, gboolean marker, guint32 rtptime)
+send_packet_to_client (GstRTSPSinkClient *client, const guint8 *data,
+    gsize size, const RtpPacketInfo *info)
 {
-  guint8 packet[12 + RTP_MAX_PAYLOAD];
-  guint16 seq = client->seqnum++;
-
-  if (payload_size > RTP_MAX_PAYLOAD)
-    return FALSE;
-
-  packet[0] = 0x80;
-  packet[1] = (marker ? 0x80 : 0x00) | RTP_PAYLOAD_TYPE;
-  packet[2] = (seq >> 8) & 0xff;
-  packet[3] = seq & 0xff;
-  packet[4] = (rtptime >> 24) & 0xff;
-  packet[5] = (rtptime >> 16) & 0xff;
-  packet[6] = (rtptime >> 8) & 0xff;
-  packet[7] = rtptime & 0xff;
-  packet[8] = (client->ssrc >> 24) & 0xff;
-  packet[9] = (client->ssrc >> 16) & 0xff;
-  packet[10] = (client->ssrc >> 8) & 0xff;
-  packet[11] = client->ssrc & 0xff;
-  memcpy (packet + 12, payload, payload_size);
-
-  client->have_rtp_info = TRUE;
-  client->last_seq_sent = seq;
-  client->last_rtptime = rtptime;
-  client->packet_count++;
-  client->octet_count += payload_size;
+  gboolean ok;
 
   if (client->transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED)
-    return send_interleaved_packet (client, client->rtp_channel, packet,
-        12 + payload_size);
+    ok = send_interleaved_packet (client, client->rtp_channel, data, size);
+  else if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
+      client->server_rtp_socket != NULL && client->client_rtp_addr != NULL)
+    ok = send_udp_packet (client->server_rtp_socket, client->client_rtp_addr,
+        data, size, client);
+  else
+    return FALSE;
 
-  if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
-      client->server_rtp_socket != NULL && client->client_rtp_addr != NULL) {
-    if (!send_udp_packet (client->server_rtp_socket, client->client_rtp_addr,
-            packet, 12 + payload_size, client))
-      return FALSE;
+  if (!ok)
+    return FALSE;
+
+  client->have_rtp_info = TRUE;
+  client->last_seq_sent = info->seqnum;
+  client->last_rtptime = info->timestamp;
+  client->packet_count++;
+  client->octet_count += info->payload_len;
+
+  if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP)
     gst_rtsp_sink_client_maybe_send_rtcp (client, FALSE, FALSE);
-    return TRUE;
-  }
 
-  return FALSE;
+  return TRUE;
+}
+
+static void
+record_server_rtp_state (GstRTSPSinkServer *server, const RtpPacketInfo *info)
+{
+  g_mutex_lock (&server->lock);
+  server->have_latest_rtp = TRUE;
+  server->latest_seqnum = info->seqnum;
+  server->latest_rtptime = info->timestamp;
+  g_mutex_unlock (&server->lock);
 }
 
 static void
@@ -233,291 +356,53 @@ for_each_playing_client (GstRTSPSinkServer *server,
   g_list_free (snapshot);
 }
 
-static gboolean
-send_h264_nal (GstRTSPSinkClient *client, const guint8 *nal, gsize nal_size,
-    gboolean marker, guint32 rtptime)
-{
-  guint8 nal_type;
-  guint8 nri;
-  gsize offset;
-  guint8 fu_indicator;
-  guint8 fu_header;
-  gboolean start;
-  gboolean end;
-  guint8 payload[RTP_MAX_PAYLOAD];
-  gsize chunk;
-
-  if (nal_size == 0)
-    return TRUE;
-  if (nal_size <= RTP_MAX_PAYLOAD)
-    return send_rtp_packet (client, nal, nal_size, marker, rtptime);
-
-  nal_type = nal[0] & 0x1f;
-  nri = nal[0] & 0x60;
-  fu_indicator = nri | 28;
-  offset = 1;
-  start = TRUE;
-
-  while (offset < nal_size) {
-    chunk = MIN ((gsize) (RTP_MAX_PAYLOAD - 2), nal_size - offset);
-    end = (offset + chunk) == nal_size;
-    fu_header = nal_type;
-    if (start)
-      fu_header |= 0x80;
-    if (end)
-      fu_header |= 0x40;
-
-    payload[0] = fu_indicator;
-    payload[1] = fu_header;
-    memcpy (payload + 2, nal + offset, chunk);
-
-    if (!send_rtp_packet (client, payload, chunk + 2, marker && end, rtptime))
-      return FALSE;
-
-    start = FALSE;
-    offset += chunk;
-  }
-
-  return TRUE;
-}
-
-static gboolean
-send_h264_parameter_sets (GstRTSPSinkClient *client, guint32 rtptime)
-{
-  GstRTSPSinkServer *server = client->server;
-  GByteArray *sps = NULL;
-  GByteArray *pps = NULL;
-  gboolean ok;
-
-  g_mutex_lock (&server->lock);
-  if (server->h264_sps != NULL && server->h264_sps->len > 0) {
-    sps = g_byte_array_sized_new (server->h264_sps->len);
-    g_byte_array_append (sps, server->h264_sps->data, server->h264_sps->len);
-  }
-  if (server->h264_pps != NULL && server->h264_pps->len > 0) {
-    pps = g_byte_array_sized_new (server->h264_pps->len);
-    g_byte_array_append (pps, server->h264_pps->data, server->h264_pps->len);
-  }
-  g_mutex_unlock (&server->lock);
-
-  if (sps == NULL || pps == NULL) {
-    if (sps != NULL)
-      g_byte_array_unref (sps);
-    if (pps != NULL)
-      g_byte_array_unref (pps);
-    return TRUE;
-  }
-
-  ok = send_h264_nal (client, sps->data, sps->len, FALSE, rtptime);
-  if (ok)
-    ok = send_h264_nal (client, pps->data, pps->len, FALSE, rtptime);
-  g_byte_array_unref (sps);
-  g_byte_array_unref (pps);
-
-  return ok;
-}
-
 static void
-broadcast_h264_nal_cb (GstRTSPSinkClient *client, gpointer user_data)
+broadcast_rtp_cb (GstRTSPSinkClient *client, gpointer user_data)
 {
-  BroadcastNalData *data = user_data;
+  const BroadcastRtpData *payload = user_data;
 
   if (client->closed || client->state != GST_RTSP_SINK_STATE_PLAYING)
     return;
 
-  if (client->wait_for_live_idr) {
-    if (!data->au_has_idr)
-      return;
-    if (data->first_in_au) {
-      if (!send_h264_parameter_sets (client, data->rtptime))
-        return;
-      client->wait_for_live_idr = FALSE;
-    }
-  }
+  if (client->wait_for_live_idr && !payload->has_keyframe)
+    return;
 
-  send_h264_nal (client, data->nal, data->nal_size, data->marker,
-      data->rtptime);
-}
+  if (!send_packet_to_client (client, payload->info.data, payload->info.size,
+          &payload->info))
+    return;
 
-static void
-broadcast_h264_length_prefixed_au (GstRTSPSinkServer *server, const guint8 *data,
-    gsize size, guint32 rtptime)
-{
-  gsize offset = 0;
-  GPtrArray *nals = g_ptr_array_new ();
-  GArray *sizes = g_array_new (FALSE, FALSE, sizeof (gsize));
-  guint i;
-  gboolean au_has_idr = FALSE;
-  BroadcastNalData payload;
-
-  while (offset + server->nal_length_size <= size) {
-    guint32 nal_size = 0;
-    gsize nal_size_value;
-    const guint8 *nal;
-
-    if (server->nal_length_size == 4)
-      nal_size = GST_READ_UINT32_BE (data + offset);
-    else if (server->nal_length_size == 2)
-      nal_size = GST_READ_UINT16_BE (data + offset);
-    else if (server->nal_length_size == 1)
-      nal_size = data[offset];
-    else
-      break;
-
-    offset += server->nal_length_size;
-    if (offset + nal_size > size)
-      break;
-
-    nal = data + offset;
-    gst_rtsp_sink_server_note_nal (server, nal, nal_size);
-    nal_size_value = nal_size;
-    g_ptr_array_add (nals, (gpointer) nal);
-    g_array_append_val (sizes, nal_size_value);
-    if ((nal[0] & 0x1f) == 5)
-      au_has_idr = TRUE;
-    offset += nal_size;
-  }
-
-  for (i = 0; i < nals->len; i++) {
-    const guint8 *nal = g_ptr_array_index (nals, i);
-    gsize nal_size = g_array_index (sizes, gsize, i);
-
-    payload.nal = nal;
-    payload.nal_size = nal_size;
-    payload.marker = (i + 1) == nals->len;
-    payload.au_has_idr = au_has_idr;
-    payload.first_in_au = (i == 0);
-    payload.rtptime = rtptime;
-    for_each_playing_client (server, broadcast_h264_nal_cb, &payload);
-  }
-
-  g_array_unref (sizes);
-  g_ptr_array_unref (nals);
-}
-
-static void
-broadcast_h264_bytestream_au (GstRTSPSinkServer *server, const guint8 *data,
-    gsize size, guint32 rtptime)
-{
-  gsize i = 0;
-  GPtrArray *nals = g_ptr_array_new ();
-  GArray *sizes = g_array_new (FALSE, FALSE, sizeof (gsize));
-  guint idx;
-  gboolean au_has_idr = FALSE;
-  BroadcastNalData payload;
-
-  while (i + 3 < size) {
-    gsize start = G_MAXSIZE;
-    gsize end = size;
-    gsize prefix = 0;
-    const guint8 *nal;
-    gsize nal_size;
-
-    while (i + 3 < size) {
-      if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 &&
-          data[i + 2] == 0 && data[i + 3] == 1) {
-        start = i;
-        prefix = 4;
-        break;
-      }
-      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
-        start = i;
-        prefix = 3;
-        break;
-      }
-      i++;
-    }
-    if (start == G_MAXSIZE)
-      break;
-
-    i = start + prefix;
-    end = i;
-    while (end + 3 < size) {
-      if ((end + 4 < size && data[end] == 0 && data[end + 1] == 0 &&
-              data[end + 2] == 0 && data[end + 3] == 1) ||
-          (data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 1))
-        break;
-      end++;
-    }
-
-    nal = data + i;
-    nal_size = end - i;
-    if (nal_size > 0) {
-      gst_rtsp_sink_server_note_nal (server, nal, nal_size);
-      g_ptr_array_add (nals, (gpointer) nal);
-      g_array_append_val (sizes, nal_size);
-      if ((nal[0] & 0x1f) == 5)
-        au_has_idr = TRUE;
-    }
-    i = end;
-  }
-
-  for (idx = 0; idx < nals->len; idx++) {
-    const guint8 *nal = g_ptr_array_index (nals, idx);
-    gsize nal_size = g_array_index (sizes, gsize, idx);
-
-    payload.nal = nal;
-    payload.nal_size = nal_size;
-    payload.marker = (idx + 1) == nals->len;
-    payload.au_has_idr = au_has_idr;
-    payload.first_in_au = (idx == 0);
-    payload.rtptime = rtptime;
-    for_each_playing_client (server, broadcast_h264_nal_cb, &payload);
-  }
-
-  g_array_unref (sizes);
-  g_ptr_array_unref (nals);
-}
-
-gboolean
-gst_rtsp_sink_server_set_h264_caps_internal (GstRTSPSinkServer *server,
-    GstCaps *caps, GError **error)
-{
-  GstStructure *s;
-  const gchar *stream_format;
-  const GValue *codec_data_value;
-  GstBuffer *codec_data = NULL;
-
-  s = gst_caps_get_structure (caps, 0);
-  stream_format = gst_structure_get_string (s, "stream-format");
-  if (stream_format == NULL) {
-    g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
-        "missing H264 stream-format");
-    return FALSE;
-  }
-
-  g_mutex_lock (&server->lock);
-  gst_rtsp_sink_server_reset_codec_state_unlocked (server);
-  server->codec = GST_RTSP_SINK_CODEC_H264;
-  server->length_prefixed_format = g_str_equal (stream_format, "avc") ||
-      g_str_equal (stream_format, "avc3");
-  server->nal_length_size = 4;
-
-  codec_data_value = gst_structure_get_value (s, "codec_data");
-  if (codec_data_value != NULL)
-    codec_data = gst_value_get_buffer (codec_data_value);
-  if (server->length_prefixed_format && codec_data != NULL &&
-      !gst_rtsp_sink_parse_avcc_codec_data (server, codec_data)) {
-    g_mutex_unlock (&server->lock);
-    g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
-        "invalid avc codec_data");
-    return FALSE;
-  }
-
-  gst_rtsp_sink_sdp_update_unlocked (server);
-  g_mutex_unlock (&server->lock);
-
-  return TRUE;
+  if (client->wait_for_live_idr && payload->has_keyframe)
+    client->wait_for_live_idr = FALSE;
 }
 
 void
-gst_rtsp_sink_server_broadcast_h264 (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size, guint32 rtptime)
+gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size)
 {
-  if (server->length_prefixed_format)
-    broadcast_h264_length_prefixed_au (server, data, size, rtptime);
-  else
-    broadcast_h264_bytestream_au (server, data, size, rtptime);
+  RtpPacketInfo info;
+  BroadcastRtpData payload;
+  gchar *encoding_name = NULL;
+  gboolean has_keyframe = FALSE;
+
+  if (!rtp_packet_info_parse (data, size, &info))
+    return;
+
+  g_mutex_lock (&server->lock);
+  if (server->rtp_encoding_name != NULL)
+    encoding_name = g_strdup (server->rtp_encoding_name);
+  g_mutex_unlock (&server->lock);
+
+  if (encoding_name != NULL)
+    has_keyframe = rtp_packet_is_keyframe (encoding_name, data + info.header_len,
+        info.payload_len);
+
+  record_server_rtp_state (server, &info);
+
+  payload.info = info;
+  payload.has_keyframe = has_keyframe;
+  for_each_playing_client (server, broadcast_rtp_cb, &payload);
+
+  g_free (encoding_name);
 }
 
 void
@@ -525,8 +410,9 @@ gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     GstBuffer *buffer)
 {
   GstMapInfo map;
-  guint32 rtptime;
-  GstRTSPSinkCodec codec;
+
+  g_return_if_fail (server != NULL);
+  g_return_if_fail (buffer != NULL);
 
   if (!gst_buffer_map (buffer, &map, GST_MAP_READ))
     return;
@@ -538,15 +424,9 @@ gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     return;
   }
   server->active_pushers++;
-  rtptime = buffer_rtptime_unlocked (server, GST_BUFFER_PTS (buffer));
-  server->latest_rtptime = rtptime;
-  codec = server->codec;
   g_mutex_unlock (&server->lock);
 
-  if (codec == GST_RTSP_SINK_CODEC_H264)
-    gst_rtsp_sink_server_broadcast_h264 (server, map.data, map.size, rtptime);
-  else if (codec == GST_RTSP_SINK_CODEC_H265)
-    gst_rtsp_sink_server_broadcast_h265 (server, map.data, map.size, rtptime);
+  gst_rtsp_sink_server_broadcast_rtp (server, map.data, map.size);
 
   g_mutex_lock (&server->lock);
   server->active_pushers--;
@@ -555,4 +435,24 @@ gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
   g_mutex_unlock (&server->lock);
 
   gst_buffer_unmap (buffer, &map);
+}
+
+void
+gst_rtsp_sink_server_broadcast_h264 (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size, guint32 rtptime)
+{
+  (void) server;
+  (void) data;
+  (void) size;
+  (void) rtptime;
+}
+
+void
+gst_rtsp_sink_server_broadcast_h265 (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size, guint32 rtptime)
+{
+  (void) server;
+  (void) data;
+  (void) size;
+  (void) rtptime;
 }

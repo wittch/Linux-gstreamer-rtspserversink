@@ -233,6 +233,8 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     }
   } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
     gchar *extra_headers;
+    guint32 rtptime = 0;
+    guint16 seqnum = 0;
 
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
@@ -251,12 +253,15 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     client->state = GST_RTSP_SINK_STATE_PLAYING;
     client->pending_play_start = FALSE;
     client->wait_for_live_idr = TRUE;
+    if (server->have_latest_rtp) {
+      rtptime = server->latest_rtptime;
+      seqnum = server->latest_seqnum;
+    }
     extra_headers = g_strdup_printf (
         "Session: %s\r\n"
         "Range: npt=0.000-\r\n"
         "RTP-Info: url=%s/stream=0;seq=%u;rtptime=%u\r\n",
-        client->session_id, url,
-        client->seqnum, server->latest_rtptime);
+        client->session_id, url, seqnum, rtptime);
     response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
     g_free (extra_headers);
     gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, FALSE);

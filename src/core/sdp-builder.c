@@ -325,6 +325,144 @@ append_fmtp_field (GString *fmtp, const gchar *key, const gchar *value)
   g_string_append_printf (fmtp, "%s=%s", key, value);
 }
 
+static gboolean
+is_ignored_rtp_fmtp_field (const gchar *name)
+{
+  return g_strcmp0 (name, "media") == 0 ||
+      g_strcmp0 (name, "encoding-name") == 0 ||
+      g_strcmp0 (name, "payload") == 0 ||
+      g_strcmp0 (name, "clock-rate") == 0 ||
+      g_strcmp0 (name, "ssrc") == 0 ||
+      g_strcmp0 (name, "timestamp-offset") == 0 ||
+      g_strcmp0 (name, "seqnum-offset") == 0;
+}
+
+static gchar *
+build_rtp_fmtp_from_caps (GstCaps *caps)
+{
+  const GstStructure *s;
+  GString *fmtp;
+  gint i;
+
+  if (caps == NULL || gst_caps_is_empty (caps))
+    return g_strdup ("");
+
+  s = gst_caps_get_structure (caps, 0);
+  fmtp = g_string_new ("");
+
+  for (i = 0; i < gst_structure_n_fields (s); i++) {
+    const gchar *field_name = gst_structure_nth_field_name (s, i);
+    const GValue *value;
+    gchar *serialized;
+
+    if (field_name == NULL || is_ignored_rtp_fmtp_field (field_name))
+      continue;
+
+    value = gst_structure_get_value (s, field_name);
+    if (value == NULL)
+      continue;
+
+    if (G_VALUE_HOLDS_STRING (value))
+      serialized = g_strdup (g_value_get_string (value));
+    else
+      serialized = gst_value_serialize (value);
+    if (serialized == NULL)
+      continue;
+
+    append_fmtp_field (fmtp, field_name, serialized);
+    g_free (serialized);
+  }
+
+  if (fmtp->len == 0) {
+    g_string_free (fmtp, TRUE);
+    return g_strdup ("");
+  }
+
+  return g_string_free (fmtp, FALSE);
+}
+
+static gboolean
+rtp_caps_get_string (GstCaps *caps, const gchar *field_name, const gchar **out)
+{
+  const GstStructure *s;
+
+  if (caps == NULL || gst_caps_is_empty (caps) || out == NULL)
+    return FALSE;
+
+  s = gst_caps_get_structure (caps, 0);
+  *out = gst_structure_get_string (s, field_name);
+  return *out != NULL;
+}
+
+static guint
+rtp_caps_get_uint (GstCaps *caps, const gchar *field_name, guint fallback)
+{
+  const GstStructure *s;
+  guint value = fallback;
+
+  if (caps == NULL || gst_caps_is_empty (caps))
+    return fallback;
+
+  s = gst_caps_get_structure (caps, 0);
+  if (!gst_structure_get_uint (s, field_name, &value))
+    return fallback;
+
+  return value;
+}
+
+gboolean
+gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
+    GstCaps *caps, GError **error)
+{
+  const GstStructure *s;
+  const gchar *name;
+  const gchar *media = NULL;
+  const gchar *encoding_name = NULL;
+  gchar *fmtp = NULL;
+
+  g_return_val_if_fail (server != NULL, FALSE);
+  g_return_val_if_fail (caps != NULL, FALSE);
+
+  s = gst_caps_get_structure (caps, 0);
+  name = gst_structure_get_name (s);
+  if (g_strcmp0 (name, "application/x-rtp") != 0) {
+    g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
+        "unsupported caps type '%s'", GST_STR_NULL (name));
+    return FALSE;
+  }
+
+  if (!rtp_caps_get_string (caps, "media", &media) ||
+      g_strcmp0 (media, "video") != 0) {
+    g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
+        "application/x-rtp caps must advertise media=video");
+    return FALSE;
+  }
+
+  if (!rtp_caps_get_string (caps, "encoding-name", &encoding_name) ||
+      encoding_name[0] == '\0') {
+    g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
+        "application/x-rtp caps must include encoding-name");
+    return FALSE;
+  }
+
+  fmtp = build_rtp_fmtp_from_caps (caps);
+
+  g_mutex_lock (&server->lock);
+  gst_rtsp_sink_server_reset_codec_state_unlocked (server);
+  server->rtp_caps = gst_caps_copy (caps);
+  server->rtp_media = g_strdup (media);
+  server->rtp_encoding_name = g_strdup (encoding_name);
+  server->rtp_payload_type = rtp_caps_get_uint (caps, "payload",
+      RTP_PAYLOAD_TYPE);
+  server->rtp_clock_rate = rtp_caps_get_uint (caps, "clock-rate",
+      RTP_CLOCK_RATE);
+  server->rtp_fmtp = fmtp;
+  gst_rtsp_sink_sdp_update_unlocked (server);
+  g_mutex_unlock (&server->lock);
+
+  return TRUE;
+}
+
 void
 gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server)
 {
@@ -332,72 +470,40 @@ gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server)
 
   g_clear_pointer (&server->sdp, g_free);
 
-  switch (server->codec) {
-    case GST_RTSP_SINK_CODEC_H264:
-      if (server->h264_sprop_parameter_sets != NULL &&
-          server->h264_profile_level_id != NULL) {
-        fmtp = g_strdup_printf (
-            "a=fmtp:%u packetization-mode=1;sprop-parameter-sets=%s;profile-level-id=%s\r\n",
-            RTP_PAYLOAD_TYPE, server->h264_sprop_parameter_sets,
-            server->h264_profile_level_id);
-      } else {
-        fmtp = g_strdup ("");
-      }
-
-      server->sdp = g_strdup_printf (
-          "v=0\r\n"
-          "o=- 0 0 IN IP4 %s\r\n"
-          "s=GStreamer RTSP Sink\r\n"
-          "t=0 0\r\n"
-          "a=control:*\r\n"
-          "m=video 0 RTP/AVP %u\r\n"
-          "a=rtpmap:%u H264/%u\r\n"
-          "%s"
-          "a=control:stream=0\r\n",
-          server->address != NULL ? server->address : "0.0.0.0",
-          RTP_PAYLOAD_TYPE, RTP_PAYLOAD_TYPE, RTP_CLOCK_RATE, fmtp);
-      break;
-    case GST_RTSP_SINK_CODEC_H265:
-    {
-      GString *fmtp_fields = g_string_new ("");
-
-      append_fmtp_field (fmtp_fields, "sprop-vps", server->h265_sprop_vps);
-      append_fmtp_field (fmtp_fields, "sprop-sps", server->h265_sprop_sps);
-      append_fmtp_field (fmtp_fields, "sprop-pps", server->h265_sprop_pps);
-      if (fmtp_fields->len > 0)
-        fmtp = g_strdup_printf ("a=fmtp:%u %s\r\n", RTP_PAYLOAD_TYPE,
-            fmtp_fields->str);
-      else
-        fmtp = g_strdup ("");
-      g_string_free (fmtp_fields, TRUE);
-
-      server->sdp = g_strdup_printf (
-          "v=0\r\n"
-          "o=- 0 0 IN IP4 %s\r\n"
-          "s=GStreamer RTSP Sink\r\n"
-          "t=0 0\r\n"
-          "a=control:*\r\n"
-          "m=video 0 RTP/AVP %u\r\n"
-          "a=rtpmap:%u H265/%u\r\n"
-          "%s"
-          "a=control:stream=0\r\n",
-          server->address != NULL ? server->address : "0.0.0.0",
-          RTP_PAYLOAD_TYPE, RTP_PAYLOAD_TYPE, RTP_CLOCK_RATE, fmtp);
-      break;
-    }
-    default:
-      server->sdp = g_strdup_printf (
-          "v=0\r\n"
-          "o=- 0 0 IN IP4 %s\r\n"
-          "s=GStreamer RTSP Sink\r\n"
-          "t=0 0\r\n"
-          "a=control:*\r\n"
-          "m=video 0 RTP/AVP %u\r\n"
-          "a=control:stream=0\r\n",
-          server->address != NULL ? server->address : "0.0.0.0",
-          RTP_PAYLOAD_TYPE);
+  if (server->rtp_caps != NULL && server->rtp_encoding_name != NULL &&
+      server->rtp_media != NULL) {
+    if (server->rtp_fmtp != NULL && server->rtp_fmtp[0] != '\0')
+      fmtp = g_strdup_printf ("a=fmtp:%u %s\r\n", server->rtp_payload_type,
+          server->rtp_fmtp);
+    else
       fmtp = g_strdup ("");
-      break;
+
+    server->sdp = g_strdup_printf (
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 %s\r\n"
+        "s=GStreamer RTSP Sink\r\n"
+        "t=0 0\r\n"
+        "a=control:*\r\n"
+        "m=%s 0 RTP/AVP %u\r\n"
+        "a=rtpmap:%u %s/%u\r\n"
+        "%s"
+        "a=control:stream=0\r\n",
+        server->address != NULL ? server->address : "0.0.0.0",
+        server->rtp_media, server->rtp_payload_type, server->rtp_payload_type,
+        server->rtp_encoding_name, server->rtp_clock_rate, fmtp);
+  } else {
+    server->sdp = g_strdup_printf (
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 %s\r\n"
+        "s=GStreamer RTSP Sink\r\n"
+        "t=0 0\r\n"
+        "a=control:*\r\n"
+        "m=video 0 RTP/AVP %u\r\n"
+        "a=control:stream=0\r\n",
+        server->address != NULL ? server->address : "0.0.0.0",
+        server->rtp_payload_type != 0 ? server->rtp_payload_type :
+        RTP_PAYLOAD_TYPE);
+    fmtp = g_strdup ("");
   }
 
   g_free (fmtp);

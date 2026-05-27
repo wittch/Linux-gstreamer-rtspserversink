@@ -57,12 +57,10 @@ GST_STATIC_PAD_TEMPLATE (
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS (
-        "video/x-h264, "
-        "stream-format=(string){ avc, avc3, byte-stream }, "
-        "alignment=(string){ au, nal }; "
-        "video/x-h265, "
-        "stream-format=(string){ hvc1, hev1, byte-stream }, "
-        "alignment=(string){ au, nal }")
+        "application/x-rtp, "
+        "media=(string)video, "
+        "clock-rate=(int)90000, "
+        "encoding-name=(string){ H264, H265 }")
     );
 
 static gboolean
@@ -351,7 +349,7 @@ gst_rtsp_sink_class_init (GstRTSPSinkClass * klass)
   GstBaseSinkClass *base_sink_class = GST_BASE_SINK_CLASS (klass);
 
   GST_DEBUG_CATEGORY_INIT (gst_rtsp_sink_debug, "rtspserversink", 0,
-      "RTSP sink");
+      "RTSP RTP relay sink");
 
   gobject_class->set_property = gst_rtsp_sink_set_property;
   gobject_class->get_property = gst_rtsp_sink_get_property;
@@ -414,7 +412,7 @@ gst_rtsp_sink_class_init (GstRTSPSinkClass * klass)
 
   gst_element_class_set_static_metadata (element_class,
       "RTSP sink", "Sink/Network",
-      "Publishes a single shared RTSP stream from a pipeline sink",
+      "Relays RTP video into a shared RTSP stream",
       "Codex");
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   element_class->change_state = gst_rtsp_sink_change_state;
