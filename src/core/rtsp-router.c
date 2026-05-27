@@ -149,6 +149,15 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
         "Content-Type: application/sdp\r\n"
         "Content-Base: %s/\r\n",
         url);
+    GST_DEBUG ("serving DESCRIBE SDP: codec=%d h264-profile-level-id=%s "
+        "h264-sprop-parameter-sets=%s h265-sprop-vps=%s h265-sprop-sps=%s "
+        "h265-sprop-pps=%s",
+        server->codec,
+        GST_STR_NULL (server->h264_profile_level_id),
+        GST_STR_NULL (server->h264_sprop_parameter_sets),
+        GST_STR_NULL (server->h265_sprop_vps),
+        GST_STR_NULL (server->h265_sprop_sps),
+        GST_STR_NULL (server->h265_sprop_pps));
     response = build_basic_response (200, "OK", cseq, extra_headers,
         server->sdp != NULL ? server->sdp : "");
     g_free (extra_headers);

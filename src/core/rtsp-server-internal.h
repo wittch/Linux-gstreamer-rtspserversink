@@ -5,9 +5,22 @@
 
 #include <gio/gio.h>
 
+#ifndef GST_CAT_DEFAULT
+#define GST_CAT_DEFAULT gst_rtsp_sink_debug
+#endif
+
+GST_DEBUG_CATEGORY_EXTERN (gst_rtsp_sink_debug);
+
 #define RTP_CLOCK_RATE 90000
 #define RTP_PAYLOAD_TYPE 96
 #define RTP_MAX_PAYLOAD 1400
+
+typedef enum
+{
+  GST_RTSP_SINK_CODEC_UNKNOWN,
+  GST_RTSP_SINK_CODEC_H264,
+  GST_RTSP_SINK_CODEC_H265,
+} GstRTSPSinkCodec;
 
 typedef enum
 {
@@ -115,12 +128,19 @@ struct _GstRTSPSinkServer
   GList *clients;
   guint next_session_id;
 
-  gboolean avc_format;
+  GstRTSPSinkCodec codec;
+  gboolean length_prefixed_format;
   guint nal_length_size;
-  GByteArray *sps;
-  GByteArray *pps;
-  gchar *profile_level_id;
-  gchar *sprop_parameter_sets;
+  GByteArray *h264_sps;
+  GByteArray *h264_pps;
+  gchar *h264_profile_level_id;
+  gchar *h264_sprop_parameter_sets;
+  GByteArray *h265_vps;
+  GByteArray *h265_sps;
+  GByteArray *h265_pps;
+  gchar *h265_sprop_vps;
+  gchar *h265_sprop_sps;
+  gchar *h265_sprop_pps;
   gchar *sdp;
   gboolean have_clock_base;
   GstClockTime base_pts;
@@ -168,11 +188,20 @@ void gst_rtsp_sink_server_note_nal_unlocked (GstRTSPSinkServer *server,
     const guint8 *nal, gsize nal_size);
 void gst_rtsp_sink_server_note_nal (GstRTSPSinkServer *server,
     const guint8 *nal, gsize nal_size);
+void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server);
 gboolean gst_rtsp_sink_parse_avcc_codec_data (GstRTSPSinkServer *server,
+    GstBuffer *codec_data);
+gboolean gst_rtsp_sink_parse_hvcc_codec_data (GstRTSPSinkServer *server,
     GstBuffer *codec_data);
 
 gboolean gst_rtsp_sink_server_set_h264_caps_internal (GstRTSPSinkServer *server,
     GstCaps *caps, GError **error);
+gboolean gst_rtsp_sink_server_set_h265_caps_internal (GstRTSPSinkServer *server,
+    GstCaps *caps, GError **error);
+void gst_rtsp_sink_server_broadcast_h264 (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size, guint32 rtptime);
+void gst_rtsp_sink_server_broadcast_h265 (GstRTSPSinkServer *server,
+    const guint8 *data, gsize size, guint32 rtptime);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     GstBuffer *buffer);
 void gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,

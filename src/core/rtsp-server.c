@@ -1,5 +1,28 @@
 #include "rtsp-server-internal.h"
 
+void
+gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
+{
+  server->codec = GST_RTSP_SINK_CODEC_UNKNOWN;
+  server->length_prefixed_format = FALSE;
+  server->nal_length_size = 4;
+  g_clear_pointer (&server->h264_profile_level_id, g_free);
+  g_clear_pointer (&server->h264_sprop_parameter_sets, g_free);
+  g_clear_pointer (&server->h265_sprop_vps, g_free);
+  g_clear_pointer (&server->h265_sprop_sps, g_free);
+  g_clear_pointer (&server->h265_sprop_pps, g_free);
+  if (server->h264_sps != NULL)
+    g_byte_array_set_size (server->h264_sps, 0);
+  if (server->h264_pps != NULL)
+    g_byte_array_set_size (server->h264_pps, 0);
+  if (server->h265_vps != NULL)
+    g_byte_array_set_size (server->h265_vps, 0);
+  if (server->h265_sps != NULL)
+    g_byte_array_set_size (server->h265_sps, 0);
+  if (server->h265_pps != NULL)
+    g_byte_array_set_size (server->h265_pps, 0);
+}
+
 static guint
 server_client_count_unlocked (GstRTSPSinkServer *server)
 {
@@ -105,7 +128,7 @@ gst_rtsp_sink_server_new (void)
 
   g_mutex_init (&server->lock);
   g_cond_init (&server->cond);
-  server->nal_length_size = 4;
+  gst_rtsp_sink_server_reset_codec_state_unlocked (server);
   server->next_session_id = 1000;
   server->max_clients = 16;
   server->latency_ms = 200;
@@ -134,13 +157,22 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   g_clear_pointer (&server->username, g_free);
   g_clear_pointer (&server->password, g_free);
   g_clear_pointer (&server->realm, g_free);
-  g_clear_pointer (&server->profile_level_id, g_free);
-  g_clear_pointer (&server->sprop_parameter_sets, g_free);
   g_clear_pointer (&server->sdp, g_free);
-  if (server->sps != NULL)
-    g_byte_array_unref (server->sps);
-  if (server->pps != NULL)
-    g_byte_array_unref (server->pps);
+  g_clear_pointer (&server->h264_profile_level_id, g_free);
+  g_clear_pointer (&server->h264_sprop_parameter_sets, g_free);
+  g_clear_pointer (&server->h265_sprop_vps, g_free);
+  g_clear_pointer (&server->h265_sprop_sps, g_free);
+  g_clear_pointer (&server->h265_sprop_pps, g_free);
+  if (server->h264_sps != NULL)
+    g_byte_array_unref (server->h264_sps);
+  if (server->h264_pps != NULL)
+    g_byte_array_unref (server->h264_pps);
+  if (server->h265_vps != NULL)
+    g_byte_array_unref (server->h265_vps);
+  if (server->h265_sps != NULL)
+    g_byte_array_unref (server->h265_sps);
+  if (server->h265_pps != NULL)
+    g_byte_array_unref (server->h265_pps);
   g_free (server);
 }
 
@@ -266,13 +298,25 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
 }
 
 gboolean
-gst_rtsp_sink_server_set_h264_caps (GstRTSPSinkServer *server, GstCaps *caps,
+gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server, GstCaps *caps,
     GError **error)
 {
+  GstStructure *s;
+  const gchar *name;
+
   g_return_val_if_fail (server != NULL, FALSE);
   g_return_val_if_fail (caps != NULL, FALSE);
 
-  return gst_rtsp_sink_server_set_h264_caps_internal (server, caps, error);
+  s = gst_caps_get_structure (caps, 0);
+  name = gst_structure_get_name (s);
+  if (g_strcmp0 (name, "video/x-h264") == 0)
+    return gst_rtsp_sink_server_set_h264_caps_internal (server, caps, error);
+  if (g_strcmp0 (name, "video/x-h265") == 0)
+    return gst_rtsp_sink_server_set_h265_caps_internal (server, caps, error);
+
+  g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
+      "unsupported caps type '%s'", GST_STR_NULL (name));
+  return FALSE;
 }
 
 void

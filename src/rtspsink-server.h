@@ -31,7 +31,7 @@ gboolean gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
     const GstRTSPSinkServerConfig *config, GError **error);
 void gst_rtsp_sink_server_stop (GstRTSPSinkServer *server);
 
-gboolean gst_rtsp_sink_server_set_h264_caps (GstRTSPSinkServer *server,
+gboolean gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server,
     GstCaps *caps, GError **error);
 void gst_rtsp_sink_server_push_buffer (GstRTSPSinkServer *server,
     GstBuffer *buffer);

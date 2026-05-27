@@ -26,6 +26,8 @@ struct _GstRTSPSink
   GstRTSPSinkServer *server;
 };
 
+GST_DEBUG_CATEGORY (gst_rtsp_sink_debug);
+
 G_DEFINE_TYPE (GstRTSPSink, gst_rtsp_sink, GST_TYPE_BASE_SINK)
 
 enum
@@ -57,6 +59,9 @@ GST_STATIC_PAD_TEMPLATE (
     GST_STATIC_CAPS (
         "video/x-h264, "
         "stream-format=(string){ avc, avc3, byte-stream }, "
+        "alignment=(string){ au, nal }; "
+        "video/x-h265, "
+        "stream-format=(string){ hvc1, hev1, byte-stream }, "
         "alignment=(string){ au, nal }")
     );
 
@@ -268,9 +273,9 @@ gst_rtsp_sink_set_caps (GstBaseSink * base_sink, GstCaps * caps)
   GstRTSPSink *self = GST_RTSP_SINK (base_sink);
   GError *error = NULL;
 
-  if (!gst_rtsp_sink_server_set_h264_caps (self->server, caps, &error)) {
+  if (!gst_rtsp_sink_server_set_caps (self->server, caps, &error)) {
     GST_ELEMENT_ERROR (self, STREAM, FORMAT,
-        ("Unsupported H264 caps for RTSP sink"),
+        ("Unsupported codec caps for RTSP sink"),
         ("%s", error != NULL ? error->message : "unknown error"));
     g_clear_error (&error);
     return FALSE;
@@ -344,6 +349,9 @@ gst_rtsp_sink_class_init (GstRTSPSinkClass * klass)
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
   GstBaseSinkClass *base_sink_class = GST_BASE_SINK_CLASS (klass);
+
+  GST_DEBUG_CATEGORY_INIT (gst_rtsp_sink_debug, "rtspserversink", 0,
+      "RTSP sink");
 
   gobject_class->set_property = gst_rtsp_sink_set_property;
   gobject_class->get_property = gst_rtsp_sink_get_property;
