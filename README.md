@@ -34,7 +34,7 @@ meson compile -C builddir
 
 ## How To Use
 
-`rtspserversink` is a sink element. Put it at the end of a normal GStreamer pipeline and feed it RTP video from `rtph264pay` or `rtph265pay`.
+`rtspserversink` is a sink element. Put it at the end of a normal GStreamer pipeline and feed it `application/x-rtp` from a payloader such as `rtph264pay` or `rtph265pay`.
 
 The common runtime pattern is:
 
@@ -44,7 +44,7 @@ GST_PLUGIN_PATH=$PWD/builddir/plugin gst-launch-1.0 ...
 
 By default, the sink listens on port `8554`. Set `port` and `path` explicitly for predictable RTSP URLs.
 
-## Basic H.264 Example
+## Example: H.264 RTP Relay
 
 Start a shared RTSP stream:
 
@@ -75,7 +75,7 @@ gst-launch-1.0 -v \
   autovideosink
 ```
 
-## Basic H.265 Example
+## Example: H.265 RTP Relay
 
 Software HEVC example:
 
@@ -102,7 +102,7 @@ gst-launch-1.0 -v \
 
 ## Supported Sink Caps
 
-RTP video:
+RTP video payloads:
 
 ```text
 application/x-rtp, media=video, clock-rate=90000, encoding-name={ H264, H265 }
@@ -210,3 +210,16 @@ Additional host-specific NVIDIA notes from this machine:
 - GPU: `NVIDIA GeForce RTX 5050`
 - `nvh264enc` / `nvh265enc` preset initialization failed locally
 - Newer `nvcuda*` encoders are the preferred direction for NVIDIA validation on this host
+
+## Frame Wobble Investigation
+
+If you are debugging the black-screen or wobble symptom, use the dedicated
+validation playbook:
+
+- [RTSP frame wobble validation](docs/rtsp-frame-wobble-validation.md)
+
+To run the repro loop automatically, use the helper script:
+
+```sh
+bash scripts/rtsp-wobble-repro.sh --client gst
+```

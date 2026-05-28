@@ -251,6 +251,10 @@ gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
     server->have_rtp_ssrc = TRUE;
   server->rtp_fmtp = fmtp;
   gst_rtsp_sink_sdp_update_unlocked (server);
+  GST_DEBUG ("rtp-caps configured media=%s encoding-name=%s payload=%u clock-rate=%u fmtp=%s",
+      GST_STR_NULL (server->rtp_media), GST_STR_NULL (server->rtp_encoding_name),
+      server->rtp_payload_type, server->rtp_clock_rate,
+      GST_STR_NULL (server->rtp_fmtp));
   g_mutex_unlock (&server->lock);
 
   return TRUE;
@@ -285,6 +289,9 @@ gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server)
         server->address != NULL ? server->address : "0.0.0.0",
         server->rtp_media, server->rtp_payload_type, server->rtp_payload_type,
         server->rtp_encoding_name, server->rtp_clock_rate, fmtp);
+    GST_DEBUG ("rtp-sdp payload=%u rtpmap=%s/%u fmtp=%s",
+        server->rtp_payload_type, server->rtp_encoding_name,
+        server->rtp_clock_rate, GST_STR_NULL (server->rtp_fmtp));
   } else {
     server->sdp = g_strdup_printf (
         "v=0\r\n"

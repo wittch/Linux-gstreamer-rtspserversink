@@ -53,10 +53,25 @@ typedef struct _TransportSetup
   guint16 client_rtcp_port;
 } TransportSetup;
 
+typedef struct _RtpPacketInfo
+{
+  const guint8 *data;
+  gsize size;
+  guint8 payload_type;
+  guint32 timestamp;
+  guint16 seqnum;
+  guint32 ssrc;
+  gsize header_len;
+  gsize payload_len;
+  gboolean marker;
+} RtpPacketInfo;
+
 typedef struct _GstRTSPQueuedRtpPacket
 {
   guint8 *data;
   gsize size;
+  RtpPacketInfo info;
+  gboolean have_info;
 } GstRTSPQueuedRtpPacket;
 
 typedef struct _GstRTSPSinkClient
@@ -128,6 +143,8 @@ struct _GstRTSPSinkServer
   gboolean have_latest_rtp;
   guint16 latest_seqnum;
   guint32 latest_rtptime;
+  GQueue *warm_start_packets;
+  guint warm_start_max_packets;
   GAsyncQueue *rtp_queue;
   GThread *rtp_thread;
   guint rtp_queue_max_packets;
@@ -148,7 +165,7 @@ void gst_rtsp_sink_client_touch_keepalive (GstRTSPSinkClient *client);
 GSocketAddress * gst_rtsp_sink_client_remote_address_with_port
     (GstRTSPSinkClient *client, guint16 port);
 GstRTSPQueuedRtpPacket * gst_rtsp_sink_rtp_queue_packet_new (const guint8 *data,
-    gsize size);
+    gsize size, const RtpPacketInfo *info);
 void gst_rtsp_sink_rtp_queue_packet_free (GstRTSPQueuedRtpPacket *packet);
 
 gboolean gst_rtsp_sink_parse_request (GstRTSPSinkClient *client,
@@ -179,8 +196,10 @@ void gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server);
 gboolean gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
     GstCaps *caps, GError **error);
 void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server);
+gboolean gst_rtsp_sink_server_replay_warm_start (GstRTSPSinkServer *server,
+    GstRTSPSinkClient *client);
 void gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size);
+    const GstRTSPQueuedRtpPacket *packet);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
     GstBuffer *buffer);
 void gst_rtsp_sink_server_flush_pending_rtp_unlocked (GstRTSPSinkServer *server);

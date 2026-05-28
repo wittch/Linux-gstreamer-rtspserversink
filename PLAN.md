@@ -8,7 +8,7 @@ RTSP sink를 표준 계층 중심 구조로 구현 중이다.
 현재 기준:
 
 - element 이름: `rtspserversink`
-- 입력: `video/x-h264`
+- 입력: `application/x-rtp`
 - transport: `RTP/AVP/TCP interleaved`, `RTP/AVP UDP`
 - target: RTSP 제어는 표준에 가깝게 맞추고, 이후 신규 클라이언트 join 안정성을 보강
 
@@ -40,11 +40,8 @@ RTSP sink를 표준 계층 중심 구조로 구현 중이다.
   - SDP 생성
   - SPS/PPS 추출
   - `sprop-parameter-sets`, `profile-level-id` 구성
-- `src/core/h264-pay.c`
-  - AVC / byte-stream AU 처리
-  - RTP packetization
-  - FU-A fragmentation
-  - STAP-A prepend
+- `src/core/rtp-relay.c`
+  - RTP relay
   - UDP 최소 RTCP SR/SDES 송신
 
 ### 2. RTSP / Session State
@@ -163,6 +160,65 @@ RTSP sink를 표준 계층 중심 구조로 구현 중이다.
 - IDR 여부 판단 후 cache 갱신
 - replay 후 live path 전환
 
+## Frame Wobble Investigation Plan
+
+검증 목적은 `PLAY` 직후 신규 join 시점의 media plane 문제를 6개 가설로
+분리해서 배제하는 것이다.
+
+### Evidence Set
+
+각 재현마다 아래 4개를 같이 확보한다.
+
+- `pcap` from the RTSP/TCP or RTP/UDP exchange
+- `GST_DEBUG=rtspserversink:6` logs from the server
+- one GStreamer client trace
+- one VLC client trace
+
+### Six Checks
+
+1. `PLAY` 전/stale RTP packet 전송 여부
+   - `PLAY` 응답 이전에 이전 시점 RTP가 남아 있는지 확인한다.
+   - `PLAY` 이후 첫 패킷이 live stream의 현재 시퀀스/타임스탬프와 맞는지 본다.
+
+2. SDP `payload` / `fmtp` 와 실제 RTP packet 불일치 여부
+   - `DESCRIBE`의 `a=rtpmap`, `a=fmtp`, `payload`, `clock-rate`, `encoding-name`을 확인한다.
+   - pcap의 실제 RTP payload type과 codec parameters가 일치하는지 대조한다.
+
+3. TCP interleaved `length` / `channel` 오류 여부
+   - `$` framing이 올바른지 확인한다.
+   - `SETUP`에서 합의한 interleaved channel pair와 실제 송신 channel이 같은지 확인한다.
+   - 16-bit length가 실제 RTP packet size와 일치하는지 확인한다.
+
+4. UDP datagram 경계 오류 여부
+   - UDP datagram 하나에 RTP packet 하나가 들어가는지 확인한다.
+   - datagram이 쪼개지거나 합쳐지지 않았는지 확인한다.
+
+5. RTP packet 순서 재정렬 여부
+   - seqnum이 monotonic하게 증가하는지 확인한다.
+   - 재정렬 또는 누락이 있는지 확인한다.
+
+6. SSRC 불일치 여부
+   - server log와 pcap의 SSRC가 같은지 확인한다.
+   - join 시점에 stale SSRC를 광고하거나 바꾸지 않았는지 확인한다.
+
+### Repro Order
+
+1. 같은 upstream RTP source로 issue를 안정적으로 재현한다.
+2. GStreamer client로 먼저 확인한다.
+3. 같은 조건에서 VLC client로 다시 확인한다.
+4. TCP interleaved와 UDP를 분리해서 각각 캡처한다.
+5. 각 가설을 `true / false / unknown`으로 기록한다.
+
+### Decision Rule
+
+- 둘 다 같은 방식으로 실패하면 sink 또는 upstream RTP 생성 문제로 본다.
+- 한쪽만 실패하면 client compatibility 또는 transport handling으로 본다.
+- `PLAY` 직전/직후에 stale packet, framing error, SSRC mismatch가 보이면
+  join path 문제로 본다.
+
+See [docs/rtsp-frame-wobble-validation.md](docs/rtsp-frame-wobble-validation.md)
+for the executable checklist and evidence matrix.
+
 ## How To Reproduce Current State
 
 서버 실행:
@@ -192,8 +248,7 @@ rtsp://127.0.0.1:9562/live
 
 다음 세션 시작점:
 
-- `src/core/h264-pay.c`
+- `src/core/rtp-relay.c`
 - `src/core/rtsp-router.c`
 - `src/core/rtsp-server-internal.h`
 - `src/core/sdp-builder.c`
-

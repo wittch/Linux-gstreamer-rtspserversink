@@ -264,11 +264,11 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
       response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
       g_free (extra_headers);
     }
+    GST_DEBUG ("SETUP complete state=%s transport=%s session=%s",
+        "READY",
+        setup.transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED ? "tcp" : "udp",
+        GST_STR_NULL (client->session_id));
   } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
-    gchar *extra_headers;
-    guint32 rtptime = 0;
-    guint16 seqnum = 0;
-
     if (!require_session (client, request)) {
       g_mutex_unlock (&server->lock);
       response = build_basic_response (454, "Session Not Found", cseq, NULL,
@@ -284,6 +284,9 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
     }
 
     client->state = GST_RTSP_SINK_STATE_PLAYING;
+    GST_DEBUG ("PLAY entered state=%s session=%s queue_len=%d",
+        "PLAYING", GST_STR_NULL (client->session_id),
+        server->rtp_queue != NULL ? g_async_queue_length (server->rtp_queue) : -1);
     if (server->have_rtp_ssrc && client->ssrc != server->rtp_ssrc) {
       g_clear_pointer (&client->rtcp_cname, g_free);
       client->ssrc = server->rtp_ssrc;
@@ -291,20 +294,11 @@ gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
           server->address != NULL ? server->address : "localhost");
     }
 
-    if (!server_has_other_playing_clients_unlocked (server, client))
+    if (!server_has_other_playing_clients_unlocked (server, client)) {
+      GST_DEBUG ("PLAY is first active client, flushing stale queued RTP packets");
       gst_rtsp_sink_server_flush_pending_rtp_unlocked (server);
-
-    if (server->have_latest_rtp) {
-      rtptime = server->latest_rtptime;
-      seqnum = server->latest_seqnum;
     }
-    extra_headers = g_strdup_printf (
-        "Session: %s\r\n"
-        "Range: npt=0.000-\r\n"
-        "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u\r\n",
-        client->session_id, url, seqnum, rtptime);
-    response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-    g_free (extra_headers);
+    response = build_basic_response (200, "OK", cseq, NULL, NULL);
     gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, FALSE);
   } else if (g_ascii_strcasecmp (request->method, "PAUSE") == 0) {
     gchar *extra_headers;

@@ -101,6 +101,8 @@ gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client)
   client->rtp_channel = 0;
   client->rtcp_channel = 1;
   client->have_rtp_info = FALSE;
+  client->last_seq_sent = 0;
+  client->last_rtptime = 0;
   client->packet_count = 0;
   client->octet_count = 0;
   client->last_rtcp_monotonic_us = 0;

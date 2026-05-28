@@ -1,12 +1,18 @@
 #include "rtsp-server-internal.h"
 
 GstRTSPQueuedRtpPacket *
-gst_rtsp_sink_rtp_queue_packet_new (const guint8 *data, gsize size)
+gst_rtsp_sink_rtp_queue_packet_new (const guint8 *data, gsize size,
+    const RtpPacketInfo *info)
 {
   GstRTSPQueuedRtpPacket *packet = g_new0 (GstRTSPQueuedRtpPacket, 1);
 
   packet->data = g_memdup2 (data, size);
   packet->size = size;
+  if (info != NULL) {
+    packet->info = *info;
+    packet->info.data = packet->data;
+    packet->have_info = TRUE;
+  }
   return packet;
 }
 
@@ -33,7 +39,7 @@ rtp_broadcast_thread_main (gpointer data)
     packet = g_async_queue_timeout_pop (server->rtp_queue,
         100 * G_TIME_SPAN_MILLISECOND);
     if (packet != NULL) {
-      gst_rtsp_sink_server_broadcast_rtp (server, packet->data, packet->size);
+      gst_rtsp_sink_server_broadcast_rtp (server, packet);
       gst_rtsp_sink_rtp_queue_packet_free (packet);
 
       g_mutex_lock (&server->lock);
@@ -59,16 +65,35 @@ void
 gst_rtsp_sink_server_flush_pending_rtp_unlocked (GstRTSPSinkServer *server)
 {
   GstRTSPQueuedRtpPacket *packet;
+  guint dropped = 0;
+  gint queue_len_before;
 
   if (server == NULL || server->rtp_queue == NULL)
     return;
 
+  queue_len_before = g_async_queue_length (server->rtp_queue);
   while ((packet = g_async_queue_try_pop (server->rtp_queue)) != NULL) {
     gst_rtsp_sink_rtp_queue_packet_free (packet);
     if (server->active_pushers > 0)
       server->active_pushers--;
     server->rtp_packets_dropped++;
+    dropped++;
   }
+
+  GST_DEBUG ("rtp-queue-flush on PLAY queue_before=%d dropped=%u queue_after=%d",
+      queue_len_before, dropped, g_async_queue_length (server->rtp_queue));
+}
+
+static void
+clear_warm_start_queue_unlocked (GstRTSPSinkServer *server)
+{
+  GstRTSPQueuedRtpPacket *packet;
+
+  if (server == NULL || server->warm_start_packets == NULL)
+    return;
+
+  while ((packet = g_queue_pop_head (server->warm_start_packets)) != NULL)
+    gst_rtsp_sink_rtp_queue_packet_free (packet);
 }
 
 void
@@ -85,6 +110,7 @@ gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
   server->have_latest_rtp = FALSE;
   server->latest_seqnum = 0;
   server->latest_rtptime = 0;
+  clear_warm_start_queue_unlocked (server);
 }
 
 static guint
@@ -124,13 +150,21 @@ client_thread_main (gpointer data)
   while (!client->closed) {
     GstRTSPSinkRequest request;
     gchar *response;
+    gboolean was_play_request;
+    gboolean was_ready_before_play;
 
     if (!gst_rtsp_sink_parse_request (client, &request))
       break;
 
+    was_play_request = g_ascii_strcasecmp (request.method, "PLAY") == 0;
+    was_ready_before_play = client->state == GST_RTSP_SINK_STATE_READY;
     response = gst_rtsp_sink_handle_request (client, &request);
     if (response != NULL)
       gst_rtsp_sink_client_write_text (client, response);
+
+    if (was_play_request && was_ready_before_play &&
+        !client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
+      //gst_rtsp_sink_server_replay_warm_start (client->server, client);
 
     g_free (response);
     gst_rtsp_sink_request_clear (&request);
@@ -138,7 +172,7 @@ client_thread_main (gpointer data)
 
   if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
       !client->rtcp_bye_sent) {
-    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
+    //gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
     client->rtcp_bye_sent = TRUE;
   }
 
@@ -206,6 +240,8 @@ gst_rtsp_sink_server_new (void)
   server->drop_slow_clients = TRUE;
   server->enable_udp = TRUE;
   server->enable_tcp_interleaved = TRUE;
+  server->warm_start_packets = g_queue_new ();
+  server->warm_start_max_packets = 64;
   server->rtp_queue_max_packets = RTP_QUEUE_MAX_PACKETS;
   server->auth_mode = g_strdup ("none");
   server->username = g_strdup ("");
@@ -228,6 +264,8 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   g_clear_pointer (&server->rtp_encoding_name, g_free);
   g_clear_pointer (&server->rtp_fmtp, g_free);
   g_clear_pointer (&server->rtp_queue, g_async_queue_unref);
+  clear_warm_start_queue_unlocked (server);
+  g_clear_pointer (&server->warm_start_packets, g_queue_free);
   g_clear_pointer (&server->rtp_thread, g_thread_unref);
   g_clear_pointer (&server->address, g_free);
   g_clear_pointer (&server->path, g_free);
@@ -290,6 +328,7 @@ gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
   server->have_latest_rtp = FALSE;
   server->latest_seqnum = 0;
   server->latest_rtptime = 0;
+  clear_warm_start_queue_unlocked (server);
   server->rtp_queue = g_async_queue_new ();
   server->rtp_packets_dropped = 0;
   gst_rtsp_sink_apply_config (server, config);
