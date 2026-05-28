@@ -1,149 +1,52 @@
 # gst-rtsp-server-sink
 
-`rtspserversink` is a `GstBaseSink` element that relays `application/x-rtp` into a single shared RTSP stream directly from a GStreamer pipeline.
+Custom GStreamer sink/plugin for RTSP server style streaming.
 
-## Requirements
+## What It Supports Now
 
-- Meson
-- Ninja
-- GStreamer 1.24 development files
-- A working local GStreamer runtime with `gst-launch-1.0` and `gst-inspect-1.0`
-
-On Ubuntu-like systems, that usually means the Meson/Ninja toolchain plus the GStreamer base, good, and bad plugin packages.
+- `GstBaseSink`-based `rtspserversink`
+- Input caps:
+  - `video/x-h264`
+  - `video/x-h265`
+- Transport policy:
+  - RTP over UDP
+  - RTP over TCP interleaved
+- RTSP 1.0 control flow:
+  - `OPTIONS`
+  - `DESCRIBE`
+  - `SETUP`
+  - `PLAY`
+  - `PAUSE`
+  - `TEARDOWN`
+  - `GET_PARAMETER`
+- TCP listener on the configured `port`
+- Per-client RTSP request loop with UDP and TCP interleaved RTP delivery
+- Basic auth gate with path validation
+- SPS/PPS/VPS and keyframe warm-start caching
 
 ## Build
-
-Configure and build:
 
 ```sh
 meson setup builddir
 meson compile -C builddir
 ```
 
-Inspect the locally built plugin:
+## Inspect
 
 ```sh
 GST_PLUGIN_PATH=$PWD/builddir/plugin gst-inspect-1.0 rtspserversink
 ```
 
-Rebuild after code changes:
-
-```sh
-meson compile -C builddir
-```
-
-## How To Use
-
-`rtspserversink` is a sink element. Put it at the end of a normal GStreamer pipeline and feed it RTP video from `rtph264pay` or `rtph265pay`.
-
-The common runtime pattern is:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin gst-launch-1.0 ...
-```
-
-By default, the sink listens on port `8554`. Set `port` and `path` explicitly for predictable RTSP URLs.
-
-## Basic H.264 Example
-
-Start a shared RTSP stream:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin \
-gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  x264enc tune=zerolatency key-int-max=15 ! \
-  h264parse ! \
-  rtph264pay pt=96 ! \
-  rtspserversink port=9562 path=/live
-```
-
-Open the stream from a client:
-
-```text
-rtsp://127.0.0.1:9562/live
-```
-
-GStreamer client example:
-
-```sh
-gst-launch-1.0 -v \
-  rtspsrc location=rtsp://127.0.0.1:9562/live protocols=tcp latency=0 ! \
-  rtph264depay ! \
-  h264parse ! \
-  avdec_h264 ! \
-  autovideosink
-```
-
-## Basic H.265 Example
-
-Software HEVC example:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin \
-gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  x265enc tune=zerolatency key-int-max=15 speed-preset=ultrafast ! \
-  h265parse ! \
-  rtph265pay pt=96 ! \
-  rtspserversink port=9562 path=/live
-```
-
-GStreamer client example:
-
-```sh
-gst-launch-1.0 -v \
-  rtspsrc location=rtsp://127.0.0.1:9562/live protocols=tcp latency=0 ! \
-  rtph265depay ! \
-  h265parse ! \
-  avdec_h265 ! \
-  autovideosink
-```
-
-## Supported Sink Caps
-
-RTP video:
-
-```text
-application/x-rtp, media=video, clock-rate=90000, encoding-name={ H264, H265 }
-```
-
-## Hardware Encoder Examples
-
-### VA-API / AMD Example
-
-This path was validated locally with `vah264enc`:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin \
-gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  "video/x-raw,format=NV12" ! \
-  vah264enc ! \
-  h264parse ! \
-  rtph264pay pt=96 ! \
-  rtspserversink port=9562 path=/live
-```
-
-Notes:
-
-- Quote caps strings if they contain parentheses or if your shell is `zsh`
-- `videotestsrc` produces system-memory frames, so this confirms hardware encoding but not a zero-copy path
-
-### NVIDIA CUDA NVENC Example
-
-If `nvcudah264enc` or `nvcudah265enc` works on your machine, prefer those over the older `nvh264enc` / `nvh265enc` elements.
+## Example
 
 H.264:
 
 ```sh
 GST_PLUGIN_PATH=$PWD/builddir/plugin \
 gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1" ! \
-  nvcudah264enc ! \
+  videotestsrc num-buffers=1 is-live=true ! \
+  x264enc tune=zerolatency key-int-max=1 ! \
   h264parse ! \
-  rtph264pay pt=96 ! \
   rtspserversink port=9562 path=/live
 ```
 
@@ -152,61 +55,14 @@ H.265:
 ```sh
 GST_PLUGIN_PATH=$PWD/builddir/plugin \
 gst-launch-1.0 -q \
-  videotestsrc is-live=true ! \
-  "video/x-raw,format=NV12,width=1280,height=720,framerate=30/1" ! \
-  nvcudah265enc ! \
+  videotestsrc num-buffers=1 is-live=true ! \
+  x265enc tune=zerolatency speed-preset=ultrafast ! \
   h265parse ! \
-  rtph265pay pt=96 ! \
-  rtspserversink port=9562 path=/live
+  rtspserversink port=9563 path=/live
 ```
 
-## Troubleshooting
+## Notes
 
-### `zsh: no matches found`
-
-If your shell expands caps strings such as:
-
-```text
-video/x-raw(memory:DMABuf),format=NV12
-```
-
-quote them:
-
-```sh
-"video/x-raw(memory:DMABuf),format=NV12"
-```
-
-### `WARNING: erroneous pipeline: syntax error`
-
-Caps must be written as caps, not as standalone assignments:
-
-- Wrong: `! format=NV12 !`
-- Right: `! "video/x-raw,format=NV12" !`
-
-Also make sure `\` is the last character on the line. A trailing space after `\` breaks shell line continuation.
-
-### Confirming The Local Plugin Is Being Used
-
-Always inspect with the build-tree plugin path:
-
-```sh
-GST_PLUGIN_PATH=$PWD/builddir/plugin gst-inspect-1.0 rtspserversink
-```
-
-If `gst-inspect-1.0 rtspserversink` fails without `GST_PLUGIN_PATH`, you are testing the system environment instead of the local build.
-
-## Validation Notes
-
-Validated locally on 2026-05-27:
-
-- `GST_PLUGIN_PATH=$PWD/builddir/plugin gst-inspect-1.0 rtspserversink` reports `application/x-rtp, media=video, clock-rate=90000, encoding-name={ H264, H265 }`
-- `x264enc ! h264parse ! rtph264pay ! rtspserversink` streamed successfully
-- `x265enc ! h265parse ! rtph265pay ! rtspserversink` streamed successfully
-- `rtspsrc ! rtph265depay ! h265parse ! avdec_h265` successfully negotiated, depayloaded, parsed, and decoded the HEVC RTSP stream
-- `vah264enc ! h264parse ! rtph264pay ! rtspserversink` negotiated successfully on the local AMD VA path
-
-Additional host-specific NVIDIA notes from this machine:
-
-- GPU: `NVIDIA GeForce RTX 5050`
-- `nvh264enc` / `nvh265enc` preset initialization failed locally
-- Newer `nvcuda*` encoders are the preferred direction for NVIDIA validation on this host
+- The implementation currently targets RTSP 1.0 only.
+- Audio, multicast, and recording are still out of scope.
+- Refer to `PLAN.md` for the remaining expansion checklist.

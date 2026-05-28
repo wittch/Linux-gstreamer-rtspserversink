@@ -1,6 +1,7 @@
 src_inc = include_directories('.', 'core')
 
 rtspsink_sources = files(
+  'core/buffer-model.c',
   'gstrtspsink.c',
   'core/rtsp-client.c',
   'core/rtsp-config.c',

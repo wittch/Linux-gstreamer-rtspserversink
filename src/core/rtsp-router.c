@@ -1,388 +1,324 @@
-#include "rtsp-server-internal.h"
+#include "rtsp-router.h"
 
-static gchar *
-build_date_header (void)
+#include "sdp-builder.h"
+
+#include <string.h>
+
+static const gchar *
+gst_rtsp_sink_reason_phrase(guint status_code)
 {
-  GDateTime *now = g_date_time_new_now_utc ();
-  gchar *formatted = g_date_time_format (now, "%a, %d %b %Y %H:%M:%S GMT");
-  gchar *header = g_strdup_printf ("Date: %s\r\n", formatted);
-
-  g_free (formatted);
-  g_date_time_unref (now);
-  return header;
+  switch (status_code) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 404: return "Not Found";
+    case 454: return "Session Not Found";
+    case 455: return "Method Not Valid in This State";
+    case 461: return "Unsupported Transport";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    default: return "Error";
+  }
 }
 
 static gchar *
-build_basic_response (guint code, const gchar *reason, const gchar *cseq,
-    const gchar *extra_headers, const gchar *body)
+gst_rtsp_sink_build_response(guint status_code, guint cseq, const gchar *headers, const gchar *body)
 {
-  gchar *date_header = build_date_header ();
-  gchar *response;
-  gsize body_len = body != NULL ? strlen (body) : 0;
+  gsize body_len = body != NULL ? strlen(body) : 0;
 
-  response = g_strdup_printf (
-      "RTSP/1.0 %u %s\r\n"
-      "CSeq: %s\r\n"
-      "%s"
-      "%s"
-      "Content-Length: %u\r\n"
-      "\r\n"
-      "%s",
-      code, reason, cseq != NULL ? cseq : "0",
-      date_header,
-      extra_headers != NULL ? extra_headers : "",
-      (guint) body_len, body != NULL ? body : "");
-  g_free (date_header);
+  if (body != NULL) {
+    return g_strdup_printf("RTSP/1.0 %u %s\r\nCSeq: %u\r\nContent-Length: %zu\r\n%s\r\n%s",
+                           status_code,
+                           gst_rtsp_sink_reason_phrase(status_code),
+                           cseq,
+                           body_len,
+                           headers != NULL ? headers : "",
+                           body);
+  }
 
-  return response;
+  return g_strdup_printf("RTSP/1.0 %u %s\r\nCSeq: %u\r\n%s\r\n",
+                         status_code,
+                         gst_rtsp_sink_reason_phrase(status_code),
+                         cseq,
+                         headers != NULL ? headers : "");
 }
 
-static gchar *
-make_session_id (GstRTSPSinkServer *server)
+static guint
+gst_rtsp_sink_request_cseq(const GstRTSPSinkRequest *request)
 {
-  return g_strdup_printf ("%u", ++server->next_session_id);
+  if (request == NULL || request->cseq == NULL)
+    return 0;
+  return (guint) g_ascii_strtoull(request->cseq, NULL, 10);
 }
 
 static gboolean
-accepts_sdp (const GstRTSPSinkRequest *request)
+gst_rtsp_sink_transport_is_tcp(const gchar *transport)
 {
-  const gchar *accept = gst_rtsp_sink_request_get_header (request, "accept");
+  return transport != NULL &&
+         (g_strrstr(transport, "TCP") != NULL || g_strrstr(transport, "interleaved") != NULL);
+}
 
-  if (accept == NULL)
+static gboolean
+gst_rtsp_sink_request_path_matches(const GstRTSPSinkServerConfig *config,
+                                   const GstRTSPSinkRequest *request)
+{
+  const gchar *path = config != NULL && config->path != NULL ? config->path : "/stream";
+  const gchar *uri = request != NULL && request->uri != NULL ? request->uri : "";
+
+  return g_strrstr(uri, path) != NULL;
+}
+
+static gboolean
+gst_rtsp_sink_request_authorized(const GstRTSPSinkServerConfig *config,
+                                 const GstRTSPSinkRequest *request)
+{
+  gchar *decoded = NULL;
+  gchar *expected = NULL;
+  gsize decoded_len = 0;
+  gboolean ok = FALSE;
+  const gchar *user;
+  const gchar *password;
+
+  if (config == NULL || !config->auth_enabled)
     return TRUE;
 
-  return strstr (accept, "application/sdp") != NULL ||
-      strstr (accept, "*/*") != NULL;
-}
-
-static gboolean
-require_session (GstRTSPSinkClient *client, const GstRTSPSinkRequest *request)
-{
-  g_autofree gchar *session_id = NULL;
-
-  session_id = gst_rtsp_sink_parse_session_header (
-      gst_rtsp_sink_request_get_header (request, "session"));
-  if (session_id == NULL || client->session_id == NULL)
+  if (request == NULL || request->authorization == NULL)
     return FALSE;
 
-  return g_strcmp0 (session_id, client->session_id) == 0;
+  if (!g_str_has_prefix(request->authorization, "Basic "))
+    return FALSE;
+
+  decoded = (gchar *) g_base64_decode(request->authorization + 6, &decoded_len);
+  if (decoded == NULL || decoded_len == 0)
+    goto done;
+
+  user = config->auth_user != NULL ? config->auth_user : "admin";
+  password = config->auth_password != NULL ? config->auth_password : "admin";
+  expected = g_strdup_printf("%s:%s", user, password);
+  ok = decoded_len == strlen(expected) && memcmp(decoded, expected, decoded_len) == 0;
+
+done:
+  g_free(decoded);
+  g_free(expected);
+  return ok;
 }
 
 static gboolean
-server_has_other_playing_clients_unlocked (GstRTSPSinkServer *server,
-    GstRTSPSinkClient *self)
+gst_rtsp_sink_route_request(GstRTSPSinkServerState state, const gchar *method)
 {
-  GList *iter;
+  if (method == NULL || state == GST_RTSP_SERVER_STATE_CLOSED)
+    return FALSE;
 
-  for (iter = server->clients; iter != NULL; iter = iter->next) {
-    GstRTSPSinkClient *client = iter->data;
-
-    if (client == self)
-      continue;
-    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
-      return TRUE;
-  }
+  if (g_strcmp0(method, "OPTIONS") == 0 ||
+      g_strcmp0(method, "DESCRIBE") == 0 ||
+      g_strcmp0(method, "SETUP") == 0 ||
+      g_strcmp0(method, "PLAY") == 0 ||
+      g_strcmp0(method, "PAUSE") == 0 ||
+      g_strcmp0(method, "TEARDOWN") == 0 ||
+      g_strcmp0(method, "GET_PARAMETER") == 0)
+    return TRUE;
 
   return FALSE;
 }
 
 static gchar *
-build_response_base_url (GstRTSPSinkServer *server,
-    const GstRTSPSinkRequest *request)
+gst_rtsp_sink_control_base(const GstRTSPSinkServer *server, const GstRTSPSinkRequest *request)
 {
-  const gchar *host = gst_rtsp_sink_request_get_header (request, "host");
-  const gchar *scheme;
-  const gchar *path;
+  const GstRTSPSinkServerConfig *config = gst_rtsp_sink_server_get_config(server);
+  const gchar *host = request != NULL && request->host != NULL ? request->host : "127.0.0.1";
+  guint port = config != NULL ? config->port : 8554;
+  const gchar *path = (config != NULL && config->path != NULL) ? config->path : "/stream";
 
-  if (request->uri != NULL && g_str_has_prefix (request->uri, "rtsp://")) {
-    path = strchr (request->uri + strlen ("rtsp://"), '/');
-    if (path != NULL)
-      return g_strndup (request->uri, path - request->uri);
-    return g_strdup (request->uri);
+  return g_strdup_printf("rtsp://%s:%u%s/", host, port, path);
+}
+
+static gchar *
+gst_rtsp_sink_extract_transport_value(const gchar *transport, const gchar *prefix)
+{
+  const gchar *value;
+  gchar *copy;
+  gchar *semi;
+
+  if (transport == NULL || prefix == NULL)
+    return NULL;
+
+  value = g_strrstr(transport, prefix);
+  if (value == NULL)
+    return NULL;
+
+  copy = g_strdup(value + strlen(prefix));
+  semi = strchr(copy, ';');
+  if (semi != NULL)
+    *semi = '\0';
+  return copy;
+}
+
+static gchar *
+gst_rtsp_sink_build_transport_header(const GstRTSPSinkServer *server,
+                                     GstRTSPSinkClient *client,
+                                     const GstRTSPSinkRequest *request)
+{
+  const GstRTSPSinkServerConfig *config = gst_rtsp_sink_server_get_config(server);
+  const GstRTSPSinkRtpConfig *rtp = gst_rtsp_sink_server_get_rtp_config(server);
+  gboolean use_tcp = gst_rtsp_sink_transport_is_tcp(request != NULL ? request->transport : NULL);
+  guint server_port = gst_rtsp_sink_client_get_udp_server_port(client);
+  gchar *client_port = NULL;
+  gchar *interleaved = NULL;
+  gchar *result = NULL;
+
+  if (use_tcp) {
+    interleaved = gst_rtsp_sink_extract_transport_value(request != NULL ? request->transport : NULL,
+                                                        "interleaved=");
+    if (interleaved == NULL)
+      interleaved = g_strdup("0-1");
+    result = g_strdup_printf("Transport: RTP/AVP/TCP;unicast;interleaved=%s;mode=play;ssrc=%08x\r\n",
+                              interleaved,
+                              rtp != NULL ? rtp->ssrc : 0);
+    g_free(interleaved);
+    return result;
   }
 
-  scheme = "rtsp://";
-  if (host != NULL && host[0] != '\0')
-    return g_strdup_printf ("%s%s", scheme, host);
+  if (request != NULL && request->transport != NULL) {
+    const gchar *client_port_start = g_strstr_len(request->transport, -1, "client_port=");
+    if (client_port_start != NULL) {
+      client_port = g_strdup(client_port_start + strlen("client_port="));
+      gchar *semicolon = strchr(client_port, ';');
+      if (semicolon != NULL)
+        *semicolon = '\0';
+    }
+  }
 
-  return g_strdup_printf ("%s%s:%u", scheme, server->address, server->port);
+  if (client_port == NULL)
+    client_port = g_strdup("5000-5001");
+
+  if (server_port == 0 && config != NULL && config->port != 0)
+    server_port = config->port + 2;
+
+  result = g_strdup_printf("Transport: RTP/AVP;unicast;client_port=%s;server_port=%u-%u;mode=play;ssrc=%08x\r\n",
+                           client_port,
+                           server_port,
+                           server_port + 1,
+                           rtp != NULL ? rtp->ssrc : 0);
+  g_free(client_port);
+  return result;
+}
+
+static gboolean
+gst_rtsp_sink_request_session_matches(const GstRTSPSinkServer *server,
+                                      const GstRTSPSinkRequest *request)
+{
+  const gchar *session = gst_rtsp_sink_server_get_session_id(server);
+
+  if (request == NULL || request->session == NULL || session == NULL)
+    return TRUE;
+
+  return g_strcmp0(request->session, session) == 0;
 }
 
 gchar *
-gst_rtsp_sink_build_rtsp_url (GstRTSPSinkServer *server)
+gst_rtsp_sink_handle_request(GstRTSPSinkServer *server,
+                             GstRTSPSinkClient *client,
+                             const GstRTSPSinkRequest *request)
 {
-  return g_strdup_printf ("rtsp://%s:%u%s", server->address, server->port,
-      server->path);
-}
+  guint cseq;
+  const gchar *method;
+  const GstRTSPSinkServerConfig *config;
 
-gchar *
-gst_rtsp_sink_handle_request (GstRTSPSinkClient *client,
-    const GstRTSPSinkRequest *request)
-{
-  GstRTSPSinkServer *server = client->server;
-  gchar *path = gst_rtsp_sink_extract_path (request->uri);
-  const gchar *cseq = gst_rtsp_sink_request_get_header (request, "cseq");
-  gchar *response = NULL;
-  gchar *url = NULL;
-  gchar *base_url = NULL;
-  guint parsed_cseq = 0;
+  if (server == NULL || request == NULL || request->method == NULL)
+    return g_strdup("RTSP/1.0 400 Bad Request\r\nCSeq: 0\r\n\r\n");
 
-  (void) parsed_cseq;
+  method = request->method;
+  config = gst_rtsp_sink_server_get_config(server);
+  cseq = gst_rtsp_sink_request_cseq(request);
+  if (cseq == 0)
+    return g_strdup("RTSP/1.0 400 Bad Request\r\nCSeq: 0\r\n\r\n");
 
-  if (!gst_rtsp_sink_request_get_cseq (request, &parsed_cseq)) {
-    response = build_basic_response (400, "Bad Request", cseq, NULL, NULL);
-    goto done;
-  }
-  if (g_strcmp0 (request->version, "RTSP/1.0") != 0) {
-    response = build_basic_response (505, "RTSP Version not supported", cseq,
-        NULL, NULL);
-    goto done;
-  }
+  if (g_strcmp0(method, "OPTIONS") != 0 && !gst_rtsp_sink_request_path_matches(config, request))
+    return gst_rtsp_sink_build_response(404, cseq, "", NULL);
 
-  g_mutex_lock (&server->lock);
-  if (!gst_rtsp_sink_path_matches (path, server->path)) {
-    g_mutex_unlock (&server->lock);
-    response = build_basic_response (404, "Not Found", cseq, NULL, NULL);
-    goto done;
-  }
+  if (g_strcmp0(method, "OPTIONS") != 0 && !gst_rtsp_sink_request_authorized(config, request))
+    return gst_rtsp_sink_build_response(401,
+                                        cseq,
+                                        "WWW-Authenticate: Basic realm=\"GstRTSPSink\"\r\n",
+                                        NULL);
 
-  base_url = build_response_base_url (server, request);
-  url = g_strdup_printf ("%s%s", base_url, server->path);
-  gst_rtsp_sink_client_touch_keepalive (client);
+  if (g_strcmp0(method, "SETUP") != 0 && !gst_rtsp_sink_request_session_matches(server, request))
+    return gst_rtsp_sink_build_response(454, cseq, "", NULL);
 
-  if (g_ascii_strcasecmp (request->method, "OPTIONS") == 0) {
-    response = build_basic_response (200, "OK", cseq,
-        "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n",
-        NULL);
-  } else if (g_ascii_strcasecmp (request->method, "DESCRIBE") == 0) {
-    gchar *extra_headers;
+  if (!gst_rtsp_sink_route_request(gst_rtsp_sink_server_get_state(server), method))
+    return gst_rtsp_sink_build_response(455, cseq, "", NULL);
 
-    if (!accepts_sdp (request)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (406, "Not Acceptable", cseq, NULL, NULL);
-      goto done;
-    }
-
-    extra_headers = g_strdup_printf (
-        "Content-Type: application/sdp\r\n"
-        "Content-Base: %s/\r\n",
-        url);
-    GST_DEBUG ("serving DESCRIBE SDP: media=%s encoding-name=%s fmtp=%s",
-        GST_STR_NULL (server->rtp_media),
-        GST_STR_NULL (server->rtp_encoding_name),
-        GST_STR_NULL (server->rtp_fmtp));
-    response = build_basic_response (200, "OK", cseq, extra_headers,
-        server->sdp != NULL ? server->sdp : "");
-    g_free (extra_headers);
-  } else if (g_ascii_strcasecmp (request->method, "SETUP") == 0) {
-    const gchar *transport = gst_rtsp_sink_request_get_header (request,
-        "transport");
-    TransportSetup setup;
-
-    if (client->state == GST_RTSP_SINK_STATE_PLAYING) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (455, "Method Not Valid in This State",
-          cseq, NULL, NULL);
-      goto done;
-    }
-    if (!gst_rtsp_sink_parse_transport_header (transport, server, &setup)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (461, "Unsupported Transport", cseq,
-          NULL, NULL);
-      goto done;
-    }
-
-    if (client->session_id == NULL)
-      client->session_id = make_session_id (server);
-
-    gst_rtsp_sink_client_reset_transport (client);
-    client->transport = setup.transport;
-    client->seqnum = g_random_int_range (0, G_MAXUINT16);
-    if (client->ssrc != server->rtp_ssrc) {
-      g_clear_pointer (&client->rtcp_cname, g_free);
-      client->ssrc = server->rtp_ssrc;
-      client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
-          server->address != NULL ? server->address : "localhost");
-    }
-
-    if (setup.transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED) {
-      gchar *extra_headers;
-
-      client->state = GST_RTSP_SINK_STATE_READY;
-      client->rtp_channel = setup.rtp_channel;
-      client->rtcp_channel = setup.rtcp_channel;
-      if (server->have_rtp_ssrc) {
-        extra_headers = g_strdup_printf (
-            "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;ssrc=%08X;mode=play\r\n"
-            "Session: %s\r\n",
-            client->rtp_channel, client->rtcp_channel, client->ssrc,
-            client->session_id);
-      } else {
-        extra_headers = g_strdup_printf (
-            "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u;mode=play\r\n"
-            "Session: %s\r\n",
-            client->rtp_channel, client->rtcp_channel, client->session_id);
-      }
-      response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-      g_free (extra_headers);
-    } else {
-      gchar *extra_headers;
-      GError *udp_error = NULL;
-
-      client->client_rtp_port = setup.client_rtp_port;
-      client->client_rtcp_port = setup.client_rtcp_port;
-      client->client_rtp_addr = gst_rtsp_sink_client_remote_address_with_port (
-          client, client->client_rtp_port);
-      client->client_rtcp_addr = gst_rtsp_sink_client_remote_address_with_port (
-          client, client->client_rtcp_port);
-      if (client->client_rtp_addr == NULL || client->client_rtcp_addr == NULL ||
-          !gst_rtsp_sink_bind_udp_socket_pair (client->client_rtp_addr,
-              &client->server_rtp_socket, &client->server_rtcp_socket,
-              &setup.client_rtp_port, &setup.client_rtcp_port, &udp_error)) {
-        g_mutex_unlock (&server->lock);
-        g_clear_error (&udp_error);
-        response = build_basic_response (461, "Unsupported Transport", cseq,
-            NULL, NULL);
-        goto done;
-      }
-
-      client->state = GST_RTSP_SINK_STATE_READY;
-      if (server->have_rtp_ssrc) {
-        extra_headers = g_strdup_printf (
-            "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u;ssrc=%08X;mode=play\r\n"
-            "Session: %s\r\n",
-            client->client_rtp_port, client->client_rtcp_port,
-            setup.client_rtp_port, setup.client_rtcp_port, client->ssrc,
-            client->session_id);
-      } else {
-        extra_headers = g_strdup_printf (
-            "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u;mode=play\r\n"
-            "Session: %s\r\n",
-            client->client_rtp_port, client->client_rtcp_port,
-            setup.client_rtp_port, setup.client_rtcp_port, client->session_id);
-      }
-      response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-      g_free (extra_headers);
-    }
-  } else if (g_ascii_strcasecmp (request->method, "PLAY") == 0) {
-    gchar *extra_headers;
-    guint32 rtptime = 0;
-    guint16 seqnum = 0;
-
-    if (!require_session (client, request)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (454, "Session Not Found", cseq, NULL,
-          NULL);
-      goto done;
-    }
-    if (client->state != GST_RTSP_SINK_STATE_READY &&
-        client->state != GST_RTSP_SINK_STATE_PAUSED) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (455, "Method Not Valid in This State",
-          cseq, NULL, NULL);
-      goto done;
-    }
-
-    client->state = GST_RTSP_SINK_STATE_PLAYING;
-    if (server->have_rtp_ssrc && client->ssrc != server->rtp_ssrc) {
-      g_clear_pointer (&client->rtcp_cname, g_free);
-      client->ssrc = server->rtp_ssrc;
-      client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
-          server->address != NULL ? server->address : "localhost");
-    }
-
-    if (!server_has_other_playing_clients_unlocked (server, client))
-      gst_rtsp_sink_server_flush_pending_rtp_unlocked (server);
-
-    if (server->have_latest_rtp) {
-      rtptime = server->latest_rtptime;
-      seqnum = server->latest_seqnum;
-    }
-    extra_headers = g_strdup_printf (
-        "Session: %s\r\n"
-        "Range: npt=0.000-\r\n"
-        "RTP-Info: url=%s/trackID=0;seq=%u;rtptime=%u\r\n",
-        client->session_id, url, seqnum, rtptime);
-    response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-    g_free (extra_headers);
-    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, FALSE);
-  } else if (g_ascii_strcasecmp (request->method, "PAUSE") == 0) {
-    gchar *extra_headers;
-
-    if (!require_session (client, request)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (454, "Session Not Found", cseq, NULL,
-          NULL);
-      goto done;
-    }
-    if (client->state != GST_RTSP_SINK_STATE_PLAYING) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (455, "Method Not Valid in This State",
-          cseq, NULL, NULL);
-      goto done;
-    }
-
-    client->state = GST_RTSP_SINK_STATE_PAUSED;
-    extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
-    response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-    g_free (extra_headers);
-  } else if (g_ascii_strcasecmp (request->method, "TEARDOWN") == 0) {
-    gchar *extra_headers = NULL;
-
-    if (!require_session (client, request)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (454, "Session Not Found", cseq, NULL,
-          NULL);
-      goto done;
-    }
-    if (client->state != GST_RTSP_SINK_STATE_READY &&
-        client->state != GST_RTSP_SINK_STATE_PLAYING &&
-        client->state != GST_RTSP_SINK_STATE_PAUSED) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (455, "Method Not Valid in This State",
-          cseq, NULL, NULL);
-      goto done;
-    }
-
-    extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
-    response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-    g_free (extra_headers);
-    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
-    gst_rtsp_sink_client_reset_transport (client);
-    client->rtcp_bye_sent = TRUE;
-    client->state = GST_RTSP_SINK_STATE_CLOSED;
-    client->closed = TRUE;
-  } else if (g_ascii_strcasecmp (request->method, "GET_PARAMETER") == 0) {
-    gchar *extra_headers;
-
-    if (!require_session (client, request)) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (454, "Session Not Found", cseq, NULL,
-          NULL);
-      goto done;
-    }
-    if (client->state != GST_RTSP_SINK_STATE_READY &&
-        client->state != GST_RTSP_SINK_STATE_PLAYING &&
-        client->state != GST_RTSP_SINK_STATE_PAUSED) {
-      g_mutex_unlock (&server->lock);
-      response = build_basic_response (455, "Method Not Valid in This State",
-          cseq, NULL, NULL);
-      goto done;
-    }
-
-    extra_headers = g_strdup_printf ("Session: %s\r\n", client->session_id);
-    response = build_basic_response (200, "OK", cseq, extra_headers, NULL);
-    g_free (extra_headers);
-  } else {
-    response = build_basic_response (405, "Method Not Allowed", cseq, NULL,
-        NULL);
+  if (g_strcmp0(method, "OPTIONS") == 0) {
+    return gst_rtsp_sink_build_response(200,
+                                        cseq,
+                                        "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER\r\n",
+                                        NULL);
   }
 
-  g_mutex_unlock (&server->lock);
+  if (g_strcmp0(method, "DESCRIBE") == 0) {
+    gchar *sdp = gst_rtsp_sink_build_sdp(config, request->host);
+    gchar *content_base = gst_rtsp_sink_control_base(server, request);
+    gchar *response = g_strdup_printf("Content-Type: application/sdp\r\nContent-Base: %s\r\n",
+                                      content_base);
+    g_free(content_base);
+    gchar *body_response = gst_rtsp_sink_build_response(200, cseq, response, sdp);
+    g_free(response);
+    g_free(sdp);
+    return body_response;
+  }
 
-done:
-  g_free (base_url);
-  g_free (url);
-  g_free (path);
-  return response;
+  if (g_strcmp0(method, "SETUP") == 0) {
+    gchar *headers;
+
+    if (config != NULL && config->transport_mode == GST_RTSP_SINK_TRANSPORT_UDP && gst_rtsp_sink_transport_is_tcp(request->transport))
+      return gst_rtsp_sink_build_response(461, cseq, "", NULL);
+    if (config != NULL && config->transport_mode == GST_RTSP_SINK_TRANSPORT_TCP && !gst_rtsp_sink_transport_is_tcp(request->transport))
+      return gst_rtsp_sink_build_response(461, cseq, "", NULL);
+
+    headers = gst_rtsp_sink_build_transport_header(server, client, request);
+    gchar *session = g_strdup_printf("Session: %s;timeout=60\r\n", gst_rtsp_sink_server_get_session_id(server));
+    gchar *response_headers = g_strconcat(headers, session, NULL);
+    gchar *response = gst_rtsp_sink_build_response(200, cseq, response_headers, NULL);
+    g_free(headers);
+    g_free(session);
+    g_free(response_headers);
+    return response;
+  }
+
+  if (g_strcmp0(method, "PLAY") == 0) {
+    gchar *base = gst_rtsp_sink_control_base(server, request);
+    const GstRTSPSinkRtpConfig *rtp = gst_rtsp_sink_server_get_rtp_config(server);
+    gchar *headers = g_strdup_printf("Session: %s\r\nRange: npt=0.000-\r\nRTP-Info: url=%strack0;seq=%u;rtptime=%u\r\n",
+                                     gst_rtsp_sink_server_get_session_id(server),
+                                     base,
+                                     rtp->sequence_number_base,
+                                     rtp->timestamp_base);
+    g_free(base);
+    gchar *response = gst_rtsp_sink_build_response(200, cseq, headers, NULL);
+    g_free(headers);
+    return response;
+  }
+
+  if (g_strcmp0(method, "PAUSE") == 0) {
+    gchar *headers = g_strdup_printf("Session: %s\r\n", gst_rtsp_sink_server_get_session_id(server));
+    gchar *response = gst_rtsp_sink_build_response(200, cseq, headers, NULL);
+    g_free(headers);
+    return response;
+  }
+
+  if (g_strcmp0(method, "GET_PARAMETER") == 0) {
+    gchar *headers = g_strdup_printf("Session: %s\r\n", gst_rtsp_sink_server_get_session_id(server));
+    gchar *response = gst_rtsp_sink_build_response(200, cseq, headers, NULL);
+    g_free(headers);
+    return response;
+  }
+
+  if (g_strcmp0(method, "TEARDOWN") == 0) {
+    gchar *headers = g_strdup_printf("Session: %s\r\n", gst_rtsp_sink_server_get_session_id(server));
+    gchar *response = gst_rtsp_sink_build_response(200, cseq, headers, NULL);
+    g_free(headers);
+    return response;
+  }
+
+  return gst_rtsp_sink_build_response(501, cseq, "", NULL);
 }
