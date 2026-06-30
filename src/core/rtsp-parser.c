@@ -86,8 +86,8 @@ gst_rtsp_sink_path_matches (const gchar *request_path,
   if (request_path == NULL || expected_path == NULL)
     return FALSE;
 
-  if (expected_path[0] == '\0')
-    return g_strcmp0 (request_path, "/") == 0;
+  if (expected_path[0] == '\0' || g_strcmp0 (expected_path, "/") == 0)
+    return request_path[0] == '/';
   if (g_strcmp0 (request_path, expected_path) == 0)
     return TRUE;
 
