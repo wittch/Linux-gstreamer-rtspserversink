@@ -115,9 +115,8 @@ append_u32_be (GByteArray *array, guint32 value)
 }
 
 static void
-append_u64_ntp_be (GByteArray *array)
+append_u64_ntp_be (GByteArray *array, gint64 now_us)
 {
-  gint64 now_us = g_get_real_time ();
   guint64 unix_seconds = now_us / G_USEC_PER_SEC;
   guint64 ntp_seconds = unix_seconds + 2208988800ULL;
   guint64 fractional = ((now_us % G_USEC_PER_SEC) << 32) / G_USEC_PER_SEC;
@@ -128,24 +127,25 @@ append_u64_ntp_be (GByteArray *array)
 
 void
 gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
-    gboolean force_sender_report, gboolean send_bye)
+    guint track_id, gboolean force_sender_report, gboolean send_bye)
 {
+  GstRTSPSinkClientTrack *track = &client->tracks[track_id];
   GByteArray *packet;
   guint32 packet_ssrc;
   gint64 now_us;
   gsize packet_size;
 
-  if (client->transport != GST_RTSP_SINK_TRANSPORT_UDP ||
-      client->server_rtcp_socket == NULL || client->client_rtcp_addr == NULL)
+  if (track->transport == GST_RTSP_SINK_TRANSPORT_NONE ||
+      (!send_bye && !track->have_rtp_info) || track->rtcp_bye_sent)
     return;
 
   now_us = g_get_monotonic_time ();
   if (!force_sender_report && !send_bye &&
-      client->last_rtcp_monotonic_us != 0 &&
-      now_us - client->last_rtcp_monotonic_us < 5 * G_USEC_PER_SEC)
+      track->last_rtcp_monotonic_us != 0 &&
+      now_us - track->last_rtcp_monotonic_us < 5 * G_USEC_PER_SEC)
     return;
 
-  packet_ssrc = client->ssrc;
+  packet_ssrc = track->ssrc;
   packet = g_byte_array_new ();
 
   if (!send_bye) {
@@ -153,15 +153,15 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
 
     g_byte_array_append (packet, sr_header, sizeof (sr_header));
     append_u32_be (packet, packet_ssrc);
-    append_u64_ntp_be (packet);
-    append_u32_be (packet, client->have_rtp_info ? client->last_rtptime : 0);
-    append_u32_be (packet, (guint32) client->packet_count);
-    append_u32_be (packet, (guint32) client->octet_count);
+    append_u64_ntp_be (packet, track->presentation_time_us);
+    append_u32_be (packet, track->have_rtp_info ? track->last_rtptime : 0);
+    append_u32_be (packet, (guint32) track->packet_count);
+    append_u32_be (packet, (guint32) track->octet_count);
 
-    if (client->rtcp_cname != NULL) {
+    if (track->rtcp_cname != NULL) {
       guint8 sdes_header[] = { 0x81, 202, 0, 0 };
       guint8 item_type = 1;
-      guint8 cname_len = (guint8) MIN (strlen (client->rtcp_cname), 255);
+      guint8 cname_len = (guint8) MIN (strlen (track->rtcp_cname), 255);
       guint8 end = 0;
       guint pad;
       guint16 words;
@@ -170,7 +170,7 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
       append_u32_be (packet, packet_ssrc);
       g_byte_array_append (packet, &item_type, 1);
       g_byte_array_append (packet, &cname_len, 1);
-      g_byte_array_append (packet, (const guint8 *) client->rtcp_cname,
+      g_byte_array_append (packet, (const guint8 *) track->rtcp_cname,
           cname_len);
       g_byte_array_append (packet, &end, 1);
 
@@ -178,7 +178,7 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
       while (pad-- > 0)
         g_byte_array_append (packet, &end, 1);
 
-      words = (guint16) ((packet->len - 28) / 4);
+      words = (guint16) ((packet->len - 28) / 4 - 1);
       packet->data[30] = (words >> 8) & 0xff;
       packet->data[31] = words & 0xff;
     }
@@ -192,26 +192,32 @@ gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
   }
 
   packet_size = packet->len;
-  send_udp_packet (client->server_rtcp_socket, client->client_rtcp_addr,
-      packet->data, packet_size, client);
-  client->last_rtcp_monotonic_us = now_us;
+  if (track->transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED)
+    send_interleaved_packet (client, track->rtcp_channel, packet->data, packet_size);
+  else
+    send_udp_packet (track->server_rtcp_socket, track->client_rtcp_addr,
+        packet->data, packet_size, client);
+  if (send_bye)
+    track->rtcp_bye_sent = TRUE;
+  track->last_rtcp_monotonic_us = now_us;
   g_byte_array_unref (packet);
 }
 
 static gboolean
 send_packet_to_client (GstRTSPSinkClient *client, const guint8 *data,
-    gsize size, const RtpPacketInfo *info)
+    gsize size, const RtpPacketInfo *info, guint track_id, gint64 presentation_time_us)
 {
+  GstRTSPSinkClientTrack *track = &client->tracks[track_id];
   gboolean ok;
   const gchar *transport_name = "none";
 
-  if (client->transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED) {
+  if (track->transport == GST_RTSP_SINK_TRANSPORT_TCP_INTERLEAVED) {
     transport_name = "tcp";
-    ok = send_interleaved_packet (client, client->rtp_channel, data, size);
-  } else if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
-      client->server_rtp_socket != NULL && client->client_rtp_addr != NULL) {
+    ok = send_interleaved_packet (client, track->rtp_channel, data, size);
+  } else if (track->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
+      track->server_rtp_socket != NULL && track->client_rtp_addr != NULL) {
     transport_name = "udp";
-    ok = send_udp_packet (client->server_rtp_socket, client->client_rtp_addr,
+    ok = send_udp_packet (track->server_rtp_socket, track->client_rtp_addr,
         data, size, client);
   } else {
     return FALSE;
@@ -220,134 +226,68 @@ send_packet_to_client (GstRTSPSinkClient *client, const guint8 *data,
   GST_DEBUG ("rtp-forward transport=%s state=%d pt=%u seq=%u ts=%u marker=%d "
       "ssrc=%08x size=%" G_GSIZE_FORMAT " client_ssrc=%08x queue_len=%d",
       transport_name, client->state, info->payload_type, info->seqnum,
-      info->timestamp, info->marker, info->ssrc, size, client->ssrc,
+      info->timestamp, info->marker, info->ssrc, size, track->ssrc,
       client->server != NULL && client->server->rtp_queue != NULL ?
       g_async_queue_length (client->server->rtp_queue) : -1);
 
   if (!ok)
     return FALSE;
 
-  client->have_rtp_info = TRUE;
-  client->last_seq_sent = info->seqnum;
-  client->last_rtptime = info->timestamp;
-  client->packet_count++;
-  client->octet_count += info->payload_len;
+  track->ssrc = info->ssrc;
+  if (track->rtcp_cname == NULL)
+    track->rtcp_cname = g_strdup ("rtsp-sink@localhost");
+  track->have_rtp_info = TRUE;
+  track->last_seq_sent = info->seqnum;
+  track->last_rtptime = info->timestamp;
+  track->presentation_time_us = presentation_time_us;
+  track->packet_count++;
+  track->octet_count += info->payload_len;
 
-  if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP)
-    gst_rtsp_sink_client_maybe_send_rtcp (client, FALSE, FALSE);
+  gst_rtsp_sink_client_maybe_send_rtcp (client, track_id, FALSE, FALSE);
 
   return TRUE;
 }
 
-static gboolean
-server_has_playing_clients_unlocked (GstRTSPSinkServer *server)
-{
-  GList *iter;
-
-  for (iter = server->clients; iter != NULL; iter = iter->next) {
-    GstRTSPSinkClient *client = iter->data;
-
-    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
-      return TRUE;
-  }
-
-  return FALSE;
-}
-
-static void
-log_rtp_packet (const RtpPacketInfo *info, GstRTSPSinkServer *server)
-{
-  GST_DEBUG ("rtp-recv pt=%u seq=%u ts=%u marker=%d ssrc=%08x size=%" G_GSIZE_FORMAT
-      " header=%" G_GSIZE_FORMAT " payload=%" G_GSIZE_FORMAT " queue_len=%d playing=%d",
-      info->payload_type, info->seqnum, info->timestamp, info->marker,
-      info->ssrc, info->size, info->header_len, info->payload_len,
-      server->rtp_queue != NULL ? g_async_queue_length (server->rtp_queue) : -1,
-      server_has_playing_clients_unlocked (server));
-}
-
-static void
-record_server_rtp_state (GstRTSPSinkServer *server, const RtpPacketInfo *info)
-{
-  g_mutex_lock (&server->lock);
-  if (!server->have_rtp_ssrc) {
-    server->rtp_ssrc = info->ssrc;
-    server->have_rtp_ssrc = TRUE;
-  }
-  server->have_latest_rtp = TRUE;
-  server->latest_seqnum = info->seqnum;
-  server->latest_rtptime = info->timestamp;
-  g_mutex_unlock (&server->lock);
-}
-
-static void
-for_each_playing_client (GstRTSPSinkServer *server,
-    void (*func) (GstRTSPSinkClient *, gpointer), gpointer user_data)
-{
-  GList *snapshot = NULL;
-  GList *iter;
-
-  g_mutex_lock (&server->lock);
-  for (iter = server->clients; iter != NULL; iter = iter->next) {
-    GstRTSPSinkClient *client = iter->data;
-
-    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
-      snapshot = g_list_prepend (snapshot, client);
-  }
-  g_mutex_unlock (&server->lock);
-
-  for (iter = snapshot; iter != NULL; iter = iter->next) {
-    GstRTSPSinkClient *client = iter->data;
-
-    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING)
-      func (client, user_data);
-  }
-
-  g_list_free (snapshot);
-}
-
-static void
-broadcast_rtp_cb (GstRTSPSinkClient *client, gpointer user_data)
-{
-  const RtpPacketInfo *info = user_data;
-
-  if (client->closed || client->state != GST_RTSP_SINK_STATE_PLAYING)
-    return;
-
-  if (!send_packet_to_client (client, info->data, info->size, info))
-    return;
-}
-
 void
 gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size)
+    guint track_id, const guint8 *data, gsize size, gint64 presentation_time_us)
 {
   RtpPacketInfo info;
-
-  if (!rtp_packet_info_parse (data, size, &info))
+  GstRTSPSinkTrack *track;
+  if (track_id > 1 || !rtp_packet_info_parse (data, size, &info))
     return;
-
-  record_server_rtp_state (server, &info);
-
   g_mutex_lock (&server->lock);
-  log_rtp_packet (&info, server);
-  if (!server_has_playing_clients_unlocked (server)) {
+  track = &server->tracks[track_id];
+  if (track->rtp_caps == NULL || info.payload_type != track->rtp_payload_type) {
     g_mutex_unlock (&server->lock);
     return;
   }
+  track->rtp_ssrc = info.ssrc;
+  track->have_rtp_ssrc = TRUE;
+  track->have_latest_rtp = TRUE;
+  track->latest_seqnum = info.seqnum;
+  track->latest_rtptime = info.timestamp;
+  /* Serialize SETUP/TEARDOWN and forwarding so transports cannot be freed
+   * while the broadcast thread uses them. Socket writes have a timeout. */
+  for (GList *iter = server->clients; iter != NULL; iter = iter->next) {
+    GstRTSPSinkClient *client = iter->data;
+    if (!client->closed && client->state == GST_RTSP_SINK_STATE_PLAYING &&
+        client->tracks[track_id].transport != GST_RTSP_SINK_TRANSPORT_NONE)
+      send_packet_to_client (client, data, size, &info, track_id, presentation_time_us);
+  }
   g_mutex_unlock (&server->lock);
-
-  for_each_playing_client (server, broadcast_rtp_cb, &info);
 }
 
 void
 gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
-    GstBuffer *buffer)
+    guint track_id, GstBuffer *buffer, gint64 presentation_time_us)
 {
   GstMapInfo map;
   GstRTSPQueuedRtpPacket *packet;
   gint queue_len;
 
   g_return_if_fail (server != NULL);
+  g_return_if_fail (track_id < 2);
   g_return_if_fail (buffer != NULL);
 
   if (!gst_buffer_map (buffer, &map, GST_MAP_READ))
@@ -363,6 +303,8 @@ gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
   g_mutex_unlock (&server->lock);
 
   packet = gst_rtsp_sink_rtp_queue_packet_new (map.data, map.size);
+  packet->track_id = track_id;
+  packet->presentation_time_us = presentation_time_us;
   g_async_queue_push (server->rtp_queue, packet);
 
   while ((queue_len = g_async_queue_length (server->rtp_queue)) >

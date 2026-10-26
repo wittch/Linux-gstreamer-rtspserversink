@@ -3,10 +3,15 @@
 #include "rtspsink-server.h"
 
 #include <gst/gst.h>
+#include <gst/base/gstbasesink.h>
 
 struct _GstRTSPSink
 {
-  GstBaseSink parent;
+  GstBin parent;
+  GstElement *video_sink;
+  GstElement *audio_sink;
+  gboolean sync;
+  gboolean async;
 
   GMutex lock;
   gchar *address;
@@ -28,11 +33,13 @@ struct _GstRTSPSink
 
 GST_DEBUG_CATEGORY (gst_rtsp_sink_debug);
 
-G_DEFINE_TYPE (GstRTSPSink, gst_rtsp_sink, GST_TYPE_BASE_SINK)
+G_DEFINE_TYPE (GstRTSPSink, gst_rtsp_sink, GST_TYPE_BIN)
 
 enum
 {
   PROP_0,
+  PROP_SYNC,
+  PROP_ASYNC,
   PROP_ADDRESS,
   PROP_PORT,
   PROP_PATH,
@@ -63,6 +70,135 @@ GST_STATIC_PAD_TEMPLATE (
         "encoding-name=(string){ H264, H265 }")
     );
 
+static GstStaticPadTemplate audio_template =
+GST_STATIC_PAD_TEMPLATE ("audio", GST_PAD_SINK, GST_PAD_REQUEST,
+    GST_STATIC_CAPS ("application/x-rtp, media=(string)audio, "
+        "encoding-name=(string)OPUS, clock-rate=(int)48000; "
+        "application/x-rtp, media=(string)audio, "
+        "encoding-name=(string){ PCMA, PCMU }, clock-rate=(int)8000"));
+
+/* One BaseSink per track preserves segment, flushing, preroll and EOS handling.
+ * GstBin aggregates the child EOS messages and exports their sink pads. */
+typedef struct {
+  GstBaseSink parent;
+  GstRTSPSinkServer *server;
+  guint track_id;
+} GstRTSPTrackSink;
+typedef struct { GstBaseSinkClass parent; } GstRTSPTrackSinkClass;
+G_DEFINE_TYPE (GstRTSPTrackSink, gst_rtsp_track_sink, GST_TYPE_BASE_SINK)
+
+static gboolean
+track_set_caps (GstBaseSink *base, GstCaps *caps)
+{
+  GstRTSPTrackSink *track = (GstRTSPTrackSink *) base;
+  GError *error = NULL;
+  if (!gst_rtsp_sink_server_set_caps (track->server, track->track_id, caps, &error)) {
+    GST_ELEMENT_ERROR (base, STREAM, FORMAT, ("Unsupported RTP caps"),
+        ("%s", error != NULL ? error->message : "unknown error"));
+    g_clear_error (&error);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static GstFlowReturn
+track_render (GstBaseSink *base, GstBuffer *buffer)
+{
+  GstRTSPTrackSink *track = (GstRTSPTrackSink *) base;
+  gint64 presentation_time_us = g_get_real_time ();
+  GstClock *clock = gst_element_get_clock (GST_ELEMENT (base));
+  GstClockTime running = gst_segment_to_running_time (&base->segment,
+      GST_FORMAT_TIME, GST_BUFFER_PTS (buffer));
+  if (clock != NULL && GST_CLOCK_TIME_IS_VALID (running)) {
+    GstClockTime target = gst_element_get_base_time (GST_ELEMENT (base)) + running;
+    GstClockTime now = gst_clock_get_time (clock);
+    presentation_time_us += ((gint64) target - (gint64) now) / GST_USECOND;
+  }
+  gst_clear_object (&clock);
+  gst_rtsp_sink_server_push_buffer (track->server, track->track_id, buffer,
+      presentation_time_us);
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn
+track_render_list (GstBaseSink *base, GstBufferList *list)
+{
+  for (guint i = 0; i < gst_buffer_list_length (list); i++)
+    track_render (base, gst_buffer_list_get (list, i));
+  return GST_FLOW_OK;
+}
+
+static void
+gst_rtsp_track_sink_class_init (GstRTSPTrackSinkClass *klass)
+{
+  GstElementClass *element = GST_ELEMENT_CLASS (klass);
+  GstBaseSinkClass *base = GST_BASE_SINK_CLASS (klass);
+  GstCaps *caps = gst_caps_from_string ("application/x-rtp");
+  GstPadTemplate *templ = gst_pad_template_new ("sink", GST_PAD_SINK,
+      GST_PAD_ALWAYS, caps);
+  gst_element_class_add_pad_template (element, templ);
+  gst_caps_unref (caps);
+  gst_element_class_set_static_metadata (element, "RTSP track sink",
+      "Sink/Network", "Internal RTP track input", "Codex");
+  base->set_caps = track_set_caps;
+  base->render = track_render;
+  base->render_list = track_render_list;
+}
+
+static void
+gst_rtsp_track_sink_init (GstRTSPTrackSink *track)
+{
+  gst_base_sink_set_sync (GST_BASE_SINK (track), FALSE);
+}
+
+static GstElement *
+add_track (GstRTSPSink *self, guint track_id, GstPadTemplate *templ)
+{
+  GstRTSPTrackSink *track = g_object_new (gst_rtsp_track_sink_get_type (),
+      "name", track_id == 0 ? "video-track" : "audio-track",
+      "sync", self->sync, "async", self->async, NULL);
+  GstPad *target, *ghost;
+  track->server = self->server;
+  track->track_id = track_id;
+  gst_bin_add (GST_BIN (self), GST_ELEMENT (track));
+  target = gst_element_get_static_pad (GST_ELEMENT (track), "sink");
+  ghost = gst_ghost_pad_new_from_template (track_id == 0 ? "sink" : "audio",
+      target, templ);
+  gst_object_unref (target);
+  gst_element_add_pad (GST_ELEMENT (self), ghost);
+  return GST_ELEMENT (track);
+}
+
+static GstPad *
+gst_rtsp_sink_request_new_pad (GstElement *element, GstPadTemplate *templ,
+    const gchar *name, const GstCaps *caps)
+{
+  GstRTSPSink *self = GST_RTSP_SINK (element);
+  (void) caps;
+  if (GST_STATE (self) > GST_STATE_READY || self->audio_sink != NULL ||
+      g_strcmp0 (GST_PAD_TEMPLATE_NAME_TEMPLATE (templ), "audio") != 0 ||
+      (name != NULL && g_strcmp0 (name, "audio") != 0))
+    return NULL;
+  self->audio_sink = add_track (self, 1, templ);
+  gst_element_sync_state_with_parent (self->audio_sink);
+  gst_rtsp_sink_server_enable_audio (self->server, TRUE);
+  return gst_element_get_static_pad (element, "audio");
+}
+
+static void
+gst_rtsp_sink_release_pad (GstElement *element, GstPad *pad)
+{
+  GstRTSPSink *self = GST_RTSP_SINK (element);
+  if (GST_STATE (self) > GST_STATE_READY || self->audio_sink == NULL ||
+      g_strcmp0 (GST_PAD_NAME (pad), "audio") != 0)
+    return;
+  gst_element_set_state (self->audio_sink, GST_STATE_NULL);
+  gst_element_remove_pad (element, pad);
+  gst_bin_remove (GST_BIN (self), self->audio_sink);
+  self->audio_sink = NULL;
+  gst_rtsp_sink_server_enable_audio (self->server, FALSE);
+}
+
 static gboolean
 gst_rtsp_sink_validate_path (const gchar * path)
 {
@@ -78,6 +214,16 @@ gst_rtsp_sink_set_property (GObject * object, guint prop_id,
   g_mutex_lock (&self->lock);
 
   switch (prop_id) {
+    case PROP_SYNC:
+    case PROP_ASYNC:
+      if (prop_id == PROP_SYNC)
+        self->sync = g_value_get_boolean (value);
+      else
+        self->async = g_value_get_boolean (value);
+      g_object_set_property (G_OBJECT (self->video_sink), pspec->name, value);
+      if (self->audio_sink != NULL)
+        g_object_set_property (G_OBJECT (self->audio_sink), pspec->name, value);
+      break;
     case PROP_ADDRESS:
       g_free (self->address);
       self->address = g_value_dup_string (value);
@@ -140,6 +286,12 @@ gst_rtsp_sink_get_property (GObject * object, guint prop_id,
   g_mutex_lock (&self->lock);
 
   switch (prop_id) {
+    case PROP_SYNC:
+      g_value_set_boolean (value, self->sync);
+      break;
+    case PROP_ASYNC:
+      g_value_set_boolean (value, self->async);
+      break;
     case PROP_ADDRESS:
       g_value_set_string (value, self->address);
       break;
@@ -188,6 +340,20 @@ gst_rtsp_sink_get_property (GObject * object, guint prop_id,
 }
 
 static void
+gst_rtsp_sink_dispose (GObject *object)
+{
+  GstRTSPSink *self = GST_RTSP_SINK (object);
+  if (self->audio_sink != NULL) {
+    GstPad *pad = gst_element_get_static_pad (GST_ELEMENT (self), "audio");
+    if (pad != NULL) {
+      gst_rtsp_sink_release_pad (GST_ELEMENT (self), pad);
+      gst_object_unref (pad);
+    }
+  }
+  G_OBJECT_CLASS (gst_rtsp_sink_parent_class)->dispose (object);
+}
+
+static void
 gst_rtsp_sink_finalize (GObject * object)
 {
   GstRTSPSink *self = GST_RTSP_SINK (object);
@@ -205,9 +371,8 @@ gst_rtsp_sink_finalize (GObject * object)
 }
 
 static gboolean
-gst_rtsp_sink_start (GstBaseSink * base_sink)
+gst_rtsp_sink_start (GstRTSPSink *self)
 {
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
   GstRTSPSinkServerConfig config = { 0, };
   GError *error = NULL;
   gboolean started;
@@ -252,9 +417,8 @@ gst_rtsp_sink_start (GstBaseSink * base_sink)
 }
 
 static gboolean
-gst_rtsp_sink_stop (GstBaseSink * base_sink)
+gst_rtsp_sink_stop (GstRTSPSink *self)
 {
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
 
   gst_rtsp_sink_server_stop (self->server);
 
@@ -262,59 +426,6 @@ gst_rtsp_sink_stop (GstBaseSink * base_sink)
   self->started = FALSE;
   g_mutex_unlock (&self->lock);
 
-  return TRUE;
-}
-
-static gboolean
-gst_rtsp_sink_set_caps (GstBaseSink * base_sink, GstCaps * caps)
-{
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
-  GError *error = NULL;
-
-  if (!gst_rtsp_sink_server_set_caps (self->server, caps, &error)) {
-    GST_ELEMENT_ERROR (self, STREAM, FORMAT,
-        ("Unsupported codec caps for RTSP sink"),
-        ("%s", error != NULL ? error->message : "unknown error"));
-    g_clear_error (&error);
-    return FALSE;
-  }
-
-  GST_INFO_OBJECT (self, "configured caps %" GST_PTR_FORMAT, caps);
-  return TRUE;
-}
-
-static GstFlowReturn
-gst_rtsp_sink_render (GstBaseSink * base_sink, GstBuffer * buffer)
-{
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
-
-  if (G_UNLIKELY (!self->started)) {
-    GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
-        ("RTSP sink received a buffer before start completed"),
-        ("Buffer PTS %" GST_TIME_FORMAT,
-            GST_TIME_ARGS (GST_BUFFER_PTS (buffer))));
-    return GST_FLOW_ERROR;
-  }
-
-  gst_rtsp_sink_server_push_buffer (self->server, buffer);
-  return GST_FLOW_OK;
-}
-
-static gboolean
-gst_rtsp_sink_unlock (GstBaseSink * base_sink)
-{
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
-
-  GST_DEBUG_OBJECT (self, "unlock requested");
-  return TRUE;
-}
-
-static gboolean
-gst_rtsp_sink_unlock_stop (GstBaseSink * base_sink)
-{
-  GstRTSPSink *self = GST_RTSP_SINK (base_sink);
-
-  GST_DEBUG_OBJECT (self, "unlock stop requested");
   return TRUE;
 }
 
@@ -337,8 +448,14 @@ gst_rtsp_sink_change_state (GstElement * element, GstStateChange transition)
     g_mutex_unlock (&self->lock);
   }
 
-  return GST_ELEMENT_CLASS (gst_rtsp_sink_parent_class)->change_state (element,
-      transition);
+  if (transition == GST_STATE_CHANGE_READY_TO_PAUSED && !gst_rtsp_sink_start (self))
+    return GST_STATE_CHANGE_FAILURE;
+  GstStateChangeReturn result =
+      GST_ELEMENT_CLASS (gst_rtsp_sink_parent_class)->change_state (element, transition);
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY ||
+      (transition == GST_STATE_CHANGE_READY_TO_PAUSED && result == GST_STATE_CHANGE_FAILURE))
+    gst_rtsp_sink_stop (self);
+  return result;
 }
 
 static void
@@ -346,15 +463,21 @@ gst_rtsp_sink_class_init (GstRTSPSinkClass * klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
-  GstBaseSinkClass *base_sink_class = GST_BASE_SINK_CLASS (klass);
 
   GST_DEBUG_CATEGORY_INIT (gst_rtsp_sink_debug, "rtspserversink", 0,
       "RTSP RTP relay sink");
 
   gobject_class->set_property = gst_rtsp_sink_set_property;
   gobject_class->get_property = gst_rtsp_sink_get_property;
+  gobject_class->dispose = gst_rtsp_sink_dispose;
   gobject_class->finalize = gst_rtsp_sink_finalize;
 
+  properties[PROP_SYNC] = g_param_spec_boolean ("sync", "Sync",
+      "Synchronize both input tracks to the pipeline clock", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+  properties[PROP_ASYNC] = g_param_spec_boolean ("async", "Async",
+      "Wait for preroll on each input track", TRUE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
   properties[PROP_ADDRESS] =
       g_param_spec_string ("address", "Address",
       "Address to bind the RTSP listener to", "0.0.0.0",
@@ -412,17 +535,15 @@ gst_rtsp_sink_class_init (GstRTSPSinkClass * klass)
 
   gst_element_class_set_static_metadata (element_class,
       "RTSP sink", "Sink/Network",
-      "Relays RTP video into a shared RTSP stream",
+      "Relays RTP video and optional audio into a shared RTSP stream",
       "Codex");
   gst_element_class_add_static_pad_template (element_class, &sink_template);
+  gst_element_class_add_static_pad_template (element_class, &audio_template);
   element_class->change_state = gst_rtsp_sink_change_state;
+  element_class->request_new_pad = gst_rtsp_sink_request_new_pad;
+  element_class->release_pad = gst_rtsp_sink_release_pad;
 
-  base_sink_class->start = gst_rtsp_sink_start;
-  base_sink_class->stop = gst_rtsp_sink_stop;
-  base_sink_class->set_caps = gst_rtsp_sink_set_caps;
-  base_sink_class->render = gst_rtsp_sink_render;
-  base_sink_class->unlock = gst_rtsp_sink_unlock;
-  base_sink_class->unlock_stop = gst_rtsp_sink_unlock_stop;
+
 }
 
 static void
@@ -445,5 +566,7 @@ gst_rtsp_sink_init (GstRTSPSink * self)
   self->started = FALSE;
   self->server = gst_rtsp_sink_server_new ();
 
-  gst_base_sink_set_sync (GST_BASE_SINK (self), FALSE);
+  self->async = TRUE;
+  self->video_sink = add_track (self, 0,
+      gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS (self), "sink"));
 }

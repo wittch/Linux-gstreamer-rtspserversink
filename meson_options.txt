@@ -1,0 +1,6 @@
+option(
+  'pluginsdir',
+  type: 'string',
+  value: '',
+  description: 'Plugin installation directory (default: GStreamer pkg-config pluginsdir)',
+)

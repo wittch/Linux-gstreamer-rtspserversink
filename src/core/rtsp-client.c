@@ -11,6 +11,7 @@ gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
   client = g_new0 (GstRTSPSinkClient, 1);
   client->server = server;
   client->connection = g_object_ref (connection);
+  g_socket_set_timeout (g_socket_connection_get_socket (connection), 65);
 
   base_input = g_io_stream_get_input_stream (G_IO_STREAM (connection));
   buffered_input = g_buffered_input_stream_new (base_input);
@@ -20,10 +21,6 @@ gst_rtsp_sink_client_new (GstRTSPSinkServer *server,
   g_object_unref (buffered_input);
 
   client->output = g_io_stream_get_output_stream (G_IO_STREAM (connection));
-  client->seqnum = g_random_int_range (0, G_MAXUINT16);
-  client->ssrc = server->rtp_ssrc;
-  client->rtcp_cname = g_strdup_printf ("%08x@%s", client->ssrc,
-      server->address != NULL ? server->address : "localhost");
   g_mutex_init (&client->write_lock);
   gst_rtsp_sink_client_reset_transport (client);
   gst_rtsp_sink_client_touch_keepalive (client);
@@ -38,12 +35,7 @@ gst_rtsp_sink_client_free (GstRTSPSinkClient *client)
     return;
 
   g_clear_pointer (&client->session_id, g_free);
-  g_clear_object (&client->server_rtp_socket);
-  g_clear_object (&client->server_rtcp_socket);
-  g_clear_object (&client->client_rtp_addr);
-  g_clear_object (&client->client_rtcp_addr);
-  g_clear_pointer (&client->rtcp_cname, g_free);
-  client->rtcp_bye_sent = FALSE;
+  gst_rtsp_sink_client_reset_transport (client);
   g_clear_object (&client->input);
   g_clear_object (&client->connection);
   g_mutex_clear (&client->write_lock);
@@ -92,23 +84,31 @@ gst_rtsp_sink_client_write_text (GstRTSPSinkClient *client, const gchar *text)
 }
 
 void
+gst_rtsp_sink_client_reset_track (GstRTSPSinkClientTrack *track)
+{
+  track->transport = GST_RTSP_SINK_TRANSPORT_NONE;
+  track->client_rtp_port = 0;
+  track->client_rtcp_port = 0;
+  track->rtp_channel = 0;
+  track->rtcp_channel = 1;
+  track->have_rtp_info = FALSE;
+  track->packet_count = 0;
+  track->octet_count = 0;
+  track->last_rtcp_monotonic_us = 0;
+  track->rtcp_bye_sent = FALSE;
+  g_clear_object (&track->server_rtp_socket);
+  g_clear_object (&track->server_rtcp_socket);
+  g_clear_object (&track->client_rtp_addr);
+  g_clear_object (&track->client_rtcp_addr);
+  g_clear_pointer (&track->rtcp_cname, g_free);
+}
+
+void
 gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client)
 {
+  for (guint i = 0; i < 2; i++)
+    gst_rtsp_sink_client_reset_track (&client->tracks[i]);
   client->state = GST_RTSP_SINK_STATE_INIT;
-  client->transport = GST_RTSP_SINK_TRANSPORT_NONE;
-  client->client_rtp_port = 0;
-  client->client_rtcp_port = 0;
-  client->rtp_channel = 0;
-  client->rtcp_channel = 1;
-  client->have_rtp_info = FALSE;
-  client->packet_count = 0;
-  client->octet_count = 0;
-  client->last_rtcp_monotonic_us = 0;
-  client->rtcp_bye_sent = FALSE;
-  g_clear_object (&client->server_rtp_socket);
-  g_clear_object (&client->server_rtcp_socket);
-  g_clear_object (&client->client_rtp_addr);
-  g_clear_object (&client->client_rtcp_addr);
 }
 
 void

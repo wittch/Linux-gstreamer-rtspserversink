@@ -25,6 +25,7 @@ typedef struct _GstRTSPSinkServerConfig
 } GstRTSPSinkServerConfig;
 
 GstRTSPSinkServer * gst_rtsp_sink_server_new (void);
+void gst_rtsp_sink_server_enable_audio (GstRTSPSinkServer *server, gboolean enabled);
 void gst_rtsp_sink_server_free (GstRTSPSinkServer *server);
 
 gboolean gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
@@ -32,9 +33,9 @@ gboolean gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
 void gst_rtsp_sink_server_stop (GstRTSPSinkServer *server);
 
 gboolean gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server,
-    GstCaps *caps, GError **error);
+    guint track_id, GstCaps *caps, GError **error);
 void gst_rtsp_sink_server_push_buffer (GstRTSPSinkServer *server,
-    GstBuffer *buffer);
+    guint track_id, GstBuffer *buffer, gint64 presentation_time_us);
 
 G_END_DECLS
 

@@ -33,7 +33,8 @@ rtp_broadcast_thread_main (gpointer data)
     packet = g_async_queue_timeout_pop (server->rtp_queue,
         100 * G_TIME_SPAN_MILLISECOND);
     if (packet != NULL) {
-      gst_rtsp_sink_server_broadcast_rtp (server, packet->data, packet->size);
+      gst_rtsp_sink_server_broadcast_rtp (server, packet->track_id, packet->data, packet->size,
+          packet->presentation_time_us);
       gst_rtsp_sink_rtp_queue_packet_free (packet);
 
       g_mutex_lock (&server->lock);
@@ -72,19 +73,20 @@ gst_rtsp_sink_server_flush_pending_rtp_unlocked (GstRTSPSinkServer *server)
 }
 
 void
-gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server)
+gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkTrack *track)
 {
-  g_clear_pointer (&server->rtp_caps, gst_caps_unref);
-  g_clear_pointer (&server->rtp_media, g_free);
-  g_clear_pointer (&server->rtp_encoding_name, g_free);
-  g_clear_pointer (&server->rtp_fmtp, g_free);
-  server->rtp_payload_type = 0;
-  server->rtp_clock_rate = 0;
-  server->rtp_ssrc = g_random_int ();
-  server->have_rtp_ssrc = FALSE;
-  server->have_latest_rtp = FALSE;
-  server->latest_seqnum = 0;
-  server->latest_rtptime = 0;
+  g_clear_pointer (&track->rtp_caps, gst_caps_unref);
+  g_clear_pointer (&track->rtp_media, g_free);
+  g_clear_pointer (&track->rtp_encoding_name, g_free);
+  g_clear_pointer (&track->rtp_fmtp, g_free);
+  g_clear_pointer (&track->encoding_params, g_free);
+  track->rtp_payload_type = 0;
+  track->rtp_clock_rate = 0;
+  track->rtp_ssrc = g_random_int ();
+  track->have_rtp_ssrc = FALSE;
+  track->have_latest_rtp = FALSE;
+  track->latest_seqnum = 0;
+  track->latest_rtptime = 0;
 }
 
 static guint
@@ -134,16 +136,16 @@ client_thread_main (gpointer data)
 
     g_free (response);
     gst_rtsp_sink_request_clear (&request);
+    if (client->state == GST_RTSP_SINK_STATE_CLOSED)
+      break;
   }
 
-  if (client->transport == GST_RTSP_SINK_TRANSPORT_UDP &&
-      !client->rtcp_bye_sent) {
-    gst_rtsp_sink_client_maybe_send_rtcp (client, TRUE, TRUE);
-    client->rtcp_bye_sent = TRUE;
-  }
-
+  g_mutex_lock (&client->server->lock);
+  for (guint i = 0; i < 2; i++)
+    gst_rtsp_sink_client_maybe_send_rtcp (client, i, TRUE, TRUE);
   client->closed = TRUE;
   client->state = GST_RTSP_SINK_STATE_CLOSED;
+  g_mutex_unlock (&client->server->lock);
   g_io_stream_close (G_IO_STREAM (client->connection), NULL, NULL);
   return NULL;
 }
@@ -198,8 +200,8 @@ gst_rtsp_sink_server_new (void)
 
   g_mutex_init (&server->lock);
   g_cond_init (&server->cond);
-  gst_rtsp_sink_server_reset_codec_state_unlocked (server);
-  server->rtp_ssrc = g_random_int ();
+  for (guint i = 0; i < 2; i++)
+    gst_rtsp_sink_server_reset_codec_state_unlocked (&server->tracks[i]);
   server->next_session_id = 1000;
   server->max_clients = 16;
   server->latency_ms = 200;
@@ -223,10 +225,8 @@ gst_rtsp_sink_server_free (GstRTSPSinkServer *server)
   gst_rtsp_sink_server_stop (server);
   g_cond_clear (&server->cond);
   g_mutex_clear (&server->lock);
-  g_clear_pointer (&server->rtp_caps, gst_caps_unref);
-  g_clear_pointer (&server->rtp_media, g_free);
-  g_clear_pointer (&server->rtp_encoding_name, g_free);
-  g_clear_pointer (&server->rtp_fmtp, g_free);
+  for (guint i = 0; i < 2; i++)
+    gst_rtsp_sink_server_reset_codec_state_unlocked (&server->tracks[i]);
   g_clear_pointer (&server->rtp_queue, g_async_queue_unref);
   g_clear_pointer (&server->rtp_thread, g_thread_unref);
   g_clear_pointer (&server->address, g_free);
@@ -287,9 +287,8 @@ gst_rtsp_sink_server_start (GstRTSPSinkServer *server,
     goto fail;
   }
   server->stopping = FALSE;
-  server->have_latest_rtp = FALSE;
-  server->latest_seqnum = 0;
-  server->latest_rtptime = 0;
+  for (guint i = 0; i < 2; i++)
+    gst_rtsp_sink_server_reset_codec_state_unlocked (&server->tracks[i]);
   server->rtp_queue = g_async_queue_new ();
   server->rtp_packets_dropped = 0;
   gst_rtsp_sink_apply_config (server, config);
@@ -349,8 +348,11 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
 
     client->closed = TRUE;
     client->state = GST_RTSP_SINK_STATE_CLOSED;
-    if (client->connection != NULL)
+    if (client->connection != NULL) {
+      g_socket_shutdown (g_socket_connection_get_socket (client->connection),
+          TRUE, TRUE, NULL);
       g_io_stream_close (G_IO_STREAM (client->connection), NULL, NULL);
+    }
   }
 
   for (iter = clients; iter != NULL; iter = iter->next) {
@@ -374,30 +376,30 @@ gst_rtsp_sink_server_stop (GstRTSPSinkServer *server)
 }
 
 gboolean
-gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server, GstCaps *caps,
+gst_rtsp_sink_server_set_caps (GstRTSPSinkServer *server, guint track_id, GstCaps *caps,
     GError **error)
 {
-  GstStructure *s;
-  const gchar *name;
-
   g_return_val_if_fail (server != NULL, FALSE);
   g_return_val_if_fail (caps != NULL, FALSE);
-
-  s = gst_caps_get_structure (caps, 0);
-  name = gst_structure_get_name (s);
-  if (g_strcmp0 (name, "application/x-rtp") == 0)
-    return gst_rtsp_sink_server_set_rtp_caps_internal (server, caps, error);
-
-  g_set_error (error, GST_STREAM_ERROR, GST_STREAM_ERROR_FORMAT,
-      "unsupported caps type '%s'", GST_STR_NULL (name));
-  return FALSE;
+  return gst_rtsp_sink_server_set_rtp_caps_internal (server, track_id, caps, error);
 }
 
 void
-gst_rtsp_sink_server_push_buffer (GstRTSPSinkServer *server, GstBuffer *buffer)
+gst_rtsp_sink_server_push_buffer (GstRTSPSinkServer *server, guint track_id, GstBuffer *buffer, gint64 presentation_time_us)
 {
   g_return_if_fail (server != NULL);
   g_return_if_fail (buffer != NULL);
 
-  gst_rtsp_sink_server_push_buffer_internal (server, buffer);
+  gst_rtsp_sink_server_push_buffer_internal (server, track_id, buffer, presentation_time_us);
+}
+
+void
+gst_rtsp_sink_server_enable_audio (GstRTSPSinkServer *server, gboolean enabled)
+{
+  g_mutex_lock (&server->lock);
+  server->audio_enabled = enabled;
+  if (!enabled)
+    gst_rtsp_sink_server_reset_codec_state_unlocked (&server->tracks[1]);
+  gst_rtsp_sink_sdp_update_unlocked (server);
+  g_mutex_unlock (&server->lock);
 }

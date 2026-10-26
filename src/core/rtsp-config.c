@@ -14,6 +14,8 @@ gst_rtsp_sink_apply_config (GstRTSPSinkServer *server,
   server->address = g_strdup (config->address);
   server->port = config->port;
   server->path = g_strdup (config->path != NULL ? config->path : "");
+  while (strlen (server->path) > 1 && g_str_has_suffix (server->path, "/"))
+    server->path[strlen (server->path) - 1] = '\0';
   server->backlog = config->backlog;
   server->max_clients = config->max_clients;
   server->latency_ms = config->latency_ms;

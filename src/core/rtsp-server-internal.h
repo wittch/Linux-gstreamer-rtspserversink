@@ -57,7 +57,33 @@ typedef struct _GstRTSPQueuedRtpPacket
 {
   guint8 *data;
   gsize size;
+  guint track_id;
+  gint64 presentation_time_us;
 } GstRTSPQueuedRtpPacket;
+
+typedef struct
+{
+  GstRTSPSinkTransport transport;
+  guint8 rtp_channel;
+  guint8 rtcp_channel;
+  guint16 client_rtp_port;
+  guint16 client_rtcp_port;
+  GSocket *server_rtp_socket;
+  GSocket *server_rtcp_socket;
+  GSocketAddress *client_rtp_addr;
+  GSocketAddress *client_rtcp_addr;
+  guint16 seqnum;
+  guint32 ssrc;
+  gboolean have_rtp_info;
+  guint16 last_seq_sent;
+  guint32 last_rtptime;
+  gint64 presentation_time_us;
+  guint64 packet_count;
+  guint64 octet_count;
+  gint64 last_rtcp_monotonic_us;
+  gchar *rtcp_cname;
+  gboolean rtcp_bye_sent;
+} GstRTSPSinkClientTrack;
 
 typedef struct _GstRTSPSinkClient
 {
@@ -70,27 +96,25 @@ typedef struct _GstRTSPSinkClient
   gchar *session_id;
   gboolean closed;
   GstRTSPSinkSessionState state;
-  GstRTSPSinkTransport transport;
-  guint8 rtp_channel;
-  guint8 rtcp_channel;
-  guint16 client_rtp_port;
-  guint16 client_rtcp_port;
-  GSocket *server_rtp_socket;
-  GSocket *server_rtcp_socket;
-  GSocketAddress *client_rtp_addr;
-  GSocketAddress *client_rtcp_addr;
+  GstRTSPSinkClientTrack tracks[2];
   gint64 last_keepalive_monotonic_us;
-  guint16 seqnum;
-  guint32 ssrc;
-  gboolean have_rtp_info;
-  guint16 last_seq_sent;
-  guint32 last_rtptime;
-  guint64 packet_count;
-  guint64 octet_count;
-  gint64 last_rtcp_monotonic_us;
-  gchar *rtcp_cname;
-  gboolean rtcp_bye_sent;
 } GstRTSPSinkClient;
+
+typedef struct
+{
+  GstCaps *rtp_caps;
+  gchar *rtp_media;
+  gchar *rtp_encoding_name;
+  guint rtp_payload_type;
+  guint rtp_clock_rate;
+  guint32 rtp_ssrc;
+  gboolean have_rtp_ssrc;
+  gchar *rtp_fmtp;
+  gboolean have_latest_rtp;
+  guint16 latest_seqnum;
+  guint32 latest_rtptime;
+  gchar *encoding_params;
+} GstRTSPSinkTrack;
 
 struct _GstRTSPSinkServer
 {
@@ -117,17 +141,8 @@ struct _GstRTSPSinkServer
   GList *clients;
   guint next_session_id;
 
-  GstCaps *rtp_caps;
-  gchar *rtp_media;
-  gchar *rtp_encoding_name;
-  guint rtp_payload_type;
-  guint rtp_clock_rate;
-  guint32 rtp_ssrc;
-  gboolean have_rtp_ssrc;
-  gchar *rtp_fmtp;
-  gboolean have_latest_rtp;
-  guint16 latest_seqnum;
-  guint32 latest_rtptime;
+  GstRTSPSinkTrack tracks[2];
+  gboolean audio_enabled;
   GAsyncQueue *rtp_queue;
   GThread *rtp_thread;
   guint rtp_queue_max_packets;
@@ -144,6 +159,7 @@ gboolean gst_rtsp_sink_client_write_bytes (GstRTSPSinkClient *client,
 gboolean gst_rtsp_sink_client_write_text (GstRTSPSinkClient *client,
     const gchar *text);
 void gst_rtsp_sink_client_reset_transport (GstRTSPSinkClient *client);
+void gst_rtsp_sink_client_reset_track (GstRTSPSinkClientTrack *track);
 void gst_rtsp_sink_client_touch_keepalive (GstRTSPSinkClient *client);
 GSocketAddress * gst_rtsp_sink_client_remote_address_with_port
     (GstRTSPSinkClient *client, guint16 port);
@@ -177,14 +193,14 @@ void gst_rtsp_sink_apply_config (GstRTSPSinkServer *server,
 
 void gst_rtsp_sink_sdp_update_unlocked (GstRTSPSinkServer *server);
 gboolean gst_rtsp_sink_server_set_rtp_caps_internal (GstRTSPSinkServer *server,
-    GstCaps *caps, GError **error);
-void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkServer *server);
+    guint track_id, GstCaps *caps, GError **error);
+void gst_rtsp_sink_server_reset_codec_state_unlocked (GstRTSPSinkTrack *track);
 void gst_rtsp_sink_server_broadcast_rtp (GstRTSPSinkServer *server,
-    const guint8 *data, gsize size);
+    guint track_id, const guint8 *data, gsize size, gint64 presentation_time_us);
 void gst_rtsp_sink_server_push_buffer_internal (GstRTSPSinkServer *server,
-    GstBuffer *buffer);
+    guint track_id, GstBuffer *buffer, gint64 presentation_time_us);
 void gst_rtsp_sink_server_flush_pending_rtp_unlocked (GstRTSPSinkServer *server);
 void gst_rtsp_sink_client_maybe_send_rtcp (GstRTSPSinkClient *client,
-    gboolean force_sender_report, gboolean send_bye);
+    guint track_id, gboolean force_sender_report, gboolean send_bye);
 
 #endif

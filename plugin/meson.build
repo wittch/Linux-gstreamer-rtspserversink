@@ -1,3 +1,8 @@
+pluginsdir = get_option('pluginsdir')
+if pluginsdir == ''
+  pluginsdir = gst_dep.get_variable(pkgconfig: 'pluginsdir')
+endif
+
 shared_module(
   'gstrtspserversink',
   'gstrtspsinkplugin.c',
@@ -14,5 +19,5 @@ shared_module(
   link_with: rtspsink_internal_lib,
   name_prefix: '',
   install: true,
-  install_dir: join_paths(get_option('libdir'), 'gstreamer-1.0'),
+  install_dir: pluginsdir,
 )
