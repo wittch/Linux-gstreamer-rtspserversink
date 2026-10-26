@@ -226,6 +226,40 @@ class TracksTest(unittest.TestCase):
                     time.sleep(.05)
                 receiver.set_state(Gst.State.NULL)
 
+    def test_multiple_clients(self):
+        producer, control, _ = self.start()
+        receivers = []
+        counts = {}
+        for index, transport in enumerate(('tcp', 'udp', 'tcp')):
+            receiver = self.pipeline(
+                f'rtspsrc location={control.url} protocols={transport} latency=100 name=src '
+                'src. ! application/x-rtp,media=video ! rtph264depay ! avdec_h264 ! '
+                'fakesink name=video sync=false signal-handoffs=true '
+                'src. ! application/x-rtp,media=audio ! rtpopusdepay ! opusdec ! '
+                'fakesink name=audio sync=false signal-handoffs=true')
+            receivers.append(receiver)
+            for media in ('video', 'audio'):
+                key = (index, media)
+                counts[key] = 0
+                def handoff(sink, buffer, pad, key):
+                    counts[key] += 1
+                receiver.get_by_name(media).connect('handoff', handoff, key)
+        deadline = time.monotonic() + 8
+        while min(counts.values()) < 15:
+            self.check_bus(producer)
+            for receiver in receivers:
+                self.check_bus(receiver)
+            self.assertLess(time.monotonic(), deadline, counts)
+            time.sleep(.05)
+        receivers[0].set_state(Gst.State.NULL)
+        before = dict(counts)
+        deadline = time.monotonic() + 5
+        while any(counts[key] < before[key] + 10 for key in counts if key[0] > 0):
+            for receiver in receivers[1:]:
+                self.check_bus(receiver)
+            self.assertLess(time.monotonic(), deadline, counts)
+            time.sleep(.05)
+
     def test_video_only_and_restart(self):
         pipe, client, sdp = self.start(audio=None)
         self.assertNotIn('m=audio', sdp)
